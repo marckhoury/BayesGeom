@@ -117,7 +117,12 @@
 #include <stdlib.h>
 #include <math.h>
 #include <sys/time.h>
+#ifdef CPU86
+#include <float.h>
+#endif
+#ifdef LINUX
 #include <fpu_control.h>
+#endif
 /* On some machines, the exact arithmetic routines might be defeated by the  */
 /*   use of internal extended precision floating-point registers.  Sometimes */
 /*   this problem can be fixed by defining certain values to be volatile,    */
@@ -642,15 +647,26 @@ float uniformfloatrand()
 
 void exactinit()
 {
-  int cword;
 
+#ifdef LINUX
+    int cword;
+#endif
+
+#ifdef CPU86
 #ifdef SINGLE
-  cword = 4210;                 /* set FPU control word for single precision */
-#else /* not SINGLE */
-  cword = 4722;                 /* set FPU control word for double precision */
-#endif /* not SINGLE */
-  _FPU_SETCW(cword);
-
+    _control87(_PC_24, _MCW_PC);
+#else
+    _control87(_PC_53, _MCW_PC);
+#endif
+#endif
+#ifdef LINUX
+#ifdef SINGLE
+    cword = 4210;
+#else
+    cword = 4722
+#endif
+    _FPU_SETCW(cword);
+#endif
 
   REAL half;
   REAL check, lastcheck;
