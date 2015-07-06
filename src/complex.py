@@ -11,7 +11,7 @@ from predicates import orient2d
 class Vertex(object):
     def __init__(self, coords):
         self.dim = len(coords)
-        self.v = np.array(coords, dtype=float).reshape((self.dim,))
+        self.v = np.array(coords, dtype=np.float64).reshape((self.dim,))
         
     def dimension(self):
         return self.dim
