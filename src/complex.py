@@ -123,9 +123,7 @@ class Simplex(object):
             v2 = self.vertices[1].as_np_array()
             v1, v2 = v1 - o, v2 - o
             v1, v2 = np.dot(Q, v1), np.dot(Q, v2)
-            l1, l2 = np.linalg.norm(v1), np.linalg.norm(v2)
-            l = np.linalg.norm(lc)
-            return l1 <= l <= l2
+            return v1 <= lc <= v2
         elif self.dim == 2:
             v1 = self.vertices[0].as_np_array()
             v2 = self.vertices[1].as_np_array()
