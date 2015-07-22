@@ -279,10 +279,9 @@ class SimplicialComplex(object):
 
     def initialize(self, points, d):
         n = points.shape[0]
-        kmeans = KMeans(init="k-means++", n_clusters=int(n/10))
+        kmeans = KMeans(init="k-means++", n_clusters=int(5))
         kmeans.fit(points)
         centroids = kmeans.cluster_centers_
-        print centroids
         for i in xrange(0, centroids.shape[0]):
             centroid = centroids[i]
             self.create_vertex(centroid)
@@ -307,33 +306,32 @@ class SimplicialComplex(object):
     def _construct_curve(self, points):
         delaunay = Delaunay(points)
         indices, indptr = delaunay.vertex_neighbor_vertices
+        edge_table = []
         for i in xrange(0, points.shape[0]):
             neighbors = indptr[indices[i]:indices[i+1]]
             edges = self._get_curve_edges(points, i, neighbors)
-            if (edges[0] is None or edges[1] is None):
-                ## HACK
-                ## skip points that don't have neighbors
-                ## almost certainly wrong
-                continue
-            self.create_simplex(edges)
-            print (i, edges[0]), (i, edges[1]) 
+            edge_table.append(edges)
+        for i in xrange(0, points.shape[0]):
+            for j in edge_table[i]:
+                if j != None and i in edge_table[j]:
+                    self.create_simplex([i,j])
             
     def _get_curve_edges(self, points, i, neighbors):
         min_dist = np.inf
         min_neighbor = None
         p = points[i]
         for neighbor in neighbors:
-                neighbor_pos = points[neighbor]
-                dist = np.linalg.norm(p - neighbor)
-                if dist < min_dist:
-                    min_dist = dist
-                    min_neighbor = neighbor
+            neighbor_pos = points[neighbor]
+            dist = np.linalg.norm(p - neighbor_pos)
+            if dist < min_dist:
+                min_dist = dist
+                min_neighbor = neighbor
         vec1 = points[min_neighbor] - p
         min_dist = np.inf
         min_half_neighbor = None
         for neighbor in neighbors:
             neighbor_pos = points[neighbor]
-            dist = np.linalg.norm(p - neighbor)
+            dist = np.linalg.norm(p - neighbor_pos)
             vec2 = neighbor_pos - p
             cos_theta = np.dot(vec1, vec2) / (np.linalg.norm(vec1) * np.linalg.norm(vec2))
             cos_theta = np.clip(cos_theta, -1, 1)
