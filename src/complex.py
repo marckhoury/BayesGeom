@@ -259,12 +259,14 @@ class SimplicialComplex(object):
     def proj(self, p):
         min_dist = np.inf
         min_point = None
+        min_s = None
         for s in self.simplices:
             d, q = s.proj(p)
             if d < min_dist:
                 min_dist = d
                 min_point = q
-        return (min_dist, min_point)
+                min_s = s
+        return (min_dist, min_point, min_s)
     
     def star(self, s):
         return [t for t in self.simplices if s in t]
