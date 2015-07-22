@@ -35,6 +35,7 @@ class Obs(object):
             self.dist, self.q, self.s = cmplx.proj(self.pt)
         else:
             self.dist, self.q = self.s.proj(self.pt)
+        assert self.q is not None
             
     # @profile
     def log_likelihood(self):
@@ -116,13 +117,13 @@ class BayesMesh1D(object):
 
     def sample_obs(self, n_samples):
         self.observations = []
-        pts = np.zeros((self.d, n_samples))
+        pts = np.zeros((n_samples, self.d))
         for i in range(n_samples):
             s = np.random.choice(self.cmplx.simplices)
             lmbda = np.random.rand()
             pt_src = lmbda * s.vertices[0].v + (1-lmbda) * s.vertices[1].v
             pt = self.obs_dist.rvs() + pt_src
-            pts[:, i] = pt
+            pts[i, :] = pt
             self.observations.append(Obs(pt, self.cmplx))
         return pts
 
@@ -348,32 +349,36 @@ def mh_step(model, f_apply, f_undo, verbose=False):
 
 if __name__ == '__main__':
     from pdb import pm, set_trace
-
-    V = np.array([[0, 0], [0, 1]])
-
-    cmplx = SimplicialComplex()
-    vertices = [cmplx.create_vertex(x) for x in V]
-    for i in range(len(V) - 1):
-        cmplx.create_simplex([i, i+1])
-
-    obs_pts = np.array([[1, x] for x in np.linspace(-.3, 1.3)])
-    # set_trace()
-    # print cmplx.proj([1, -.3])
-
-    m_gt = BayesMesh1D(obs_pts=obs_pts, cmplx=cmplx)
-    m_gt.draw(block=True)
-
-    
-    # V = np.array([[0, 0], [0, 1], [1, 2], [2, 1], [2, 0]])
+    # Sanity check for projections
+    # V = np.array([[0, 0], [0, 1]])
 
     # cmplx = SimplicialComplex()
     # vertices = [cmplx.create_vertex(x) for x in V]
     # for i in range(len(V) - 1):
     #     cmplx.create_simplex([i, i+1])
 
-    
-    # m_gt = BayesMesh1D(cmplx=cmplx)
+    # obs_pts = np.array([[1, x] for x in np.linspace(-.3, 1.3)])
+    # # set_trace()
+    # # print cmplx.proj([1, -.3])
+
+    # m_gt = BayesMesh1D(obs_pts=obs_pts, cmplx=cmplx)
     # m_gt.draw(block=True)
+    
+    V = np.array([[0, 0], [0, 1], [1, 2], [2, 1], [2, 0]])
+
+    cmplx = SimplicialComplex()
+    vertices = [cmplx.create_vertex(x) for x in V]
+    for i in range(len(V) - 1):
+        cmplx.create_simplex([i, i+1])
+
+    
+    m_gt = BayesMesh1D(cmplx=cmplx)
+    # m_gt.draw(block=True)
+
+    observed_pts = m_gt.sample_obs(500)
+
+    m = BayesMesh1D(obs_pts = observed_pts)
+    m.draw(block=True)
     
     
     # observed_pts = m_gt.sample_obs(500)

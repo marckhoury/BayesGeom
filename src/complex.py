@@ -279,7 +279,7 @@ class SimplicialComplex(object):
 
     def initialize(self, points, d):
         n = points.shape[0]
-        kmeans = Kmeans(init="k-means++", n_clusters=n/10)
+        kmeans = KMeans(init="k-means++", n_clusters=int(n/10))
         kmeans.fit(points)
         centroids = kmeans.cluster_centers_
         print centroids
@@ -310,6 +310,12 @@ class SimplicialComplex(object):
         for i in xrange(0, points.shape[0]):
             neighbors = indptr[indices[i]:indices[i+1]]
             edges = self._get_curve_edges(points, i, neighbors)
+            if (edges[0] is None or edges[1] is None):
+                ## HACK
+                ## skip points that don't have neighbors
+                ## almost certainly wrong
+                continue
+            self.create_simplex(edges)
             print (i, edges[0]), (i, edges[1]) 
             
     def _get_curve_edges(self, points, i, neighbors):
@@ -329,8 +335,11 @@ class SimplicialComplex(object):
             neighbor_pos = points[neighbor]
             dist = np.linalg.norm(p - neighbor)
             vec2 = neighbor_pos - p
-            angle = math.acos(np.dot(vec1, vec2) / (np.linalg.norm(vec1) * np.linalg.norm(vec2)))
-            if angle > math.pi / 2 and dist < min_dist:
+            cos_theta = np.dot(vec1, vec2) / (np.linalg.norm(vec1) * np.linalg.norm(vec2))
+            cos_theta = np.clip(cos_theta, -1, 1)
+            theta = math.acos(cos_theta)
+            # print p, neighbor_pos, theta
+            if theta > math.pi / 2 and dist < min_dist:
                 min_dist = dist
                 min_half_neighbor = neighbor
         
