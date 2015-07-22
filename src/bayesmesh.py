@@ -12,6 +12,8 @@ import time
 
 eps = 1e-8
 
+MAX_CACHE_SIZE=20
+
 class Obs(object):
     
     """
@@ -32,13 +34,31 @@ class Obs(object):
         self.s = s_source
         self.noise_dist = norm(loc=0, scale=sigma)
         if self.s is None:
-            self.dist, self.q, self.s = cmplx.proj(self.pt)
+            _, _, self.s = cmplx.proj(self.pt)
+        ## sanity check
+        assert self.s is not None
+        self._proj_cache = {}
+        self.proj() 
+
+
+    def proj(self):
+        s_key = self.s.get_key()
+        if s_key in self._proj_cache:
+            self.dist, self.q = self._proj_cache[s_key]
         else:
+            if len(self._proj_cache) > MAX_CACHE_SIZE:
+                self._proj_cache.popitem()
+            
             self.dist, self.q = self.s.proj(self.pt)
-        assert self.q is not None
+            self._proj_cache[s_key] = (self.dist, self.q)
+        return self.dist, self.q
+
+    
+
             
     # @profile
     def log_likelihood(self):
+        self.proj()
         return self.noise_dist.logpdf(self.dist)
 
     def set_source(self, s):
@@ -63,7 +83,7 @@ class BayesMesh1D(object):
 
     places a generic prior on complexes
     """
-    def __init__(self, obs_pts=None, cmplx=None, gamma=.2, lmbda=.5, obs_sigma=.05, propose_sigma=.1,
+    def __init__(self, obs_pts=None, cmplx=None, gamma=.2, lmbda=.5, obs_sigma=.05, propose_sigma=.05,
                  d=2, obs=None, N=None, P=None):
         """
         gamma: geometric variable for prior on number of simplices
@@ -129,9 +149,9 @@ class BayesMesh1D(object):
 
     def set_obs(self, pts, draw=False):
         self.observations = []
-        n_obs = pts.shape[1]
+        n_obs = pts.shape[0]
         for i in range(n_obs):
-            pt = pts[:, i].reshape((self.d, 1))
+            pt = pts[i, :]
             o_i = Obs(pt, self.cmplx)
             self.observations.append(o_i)
         if draw:
@@ -168,7 +188,7 @@ class BayesMesh1D(object):
             raw_input('go?')
                 
         proposals = [self.propose_vertices, self.propose_correspondence]
-        proposal_p = [.4, .6]
+        proposal_p = [.9, .1]
         accept = 0
         print self.log_likelihood()
         for i in range(samples):
@@ -199,33 +219,20 @@ class BayesMesh1D(object):
     # @profile            
     def propose_vertices(self):
         ## symmetric
-        s = np.random.choice(self.cmplx.simplices)
-        v_idx = np.random.choice([0, 1])
-        # print "v_idx", v_idx
-        v_old = s.vertices[v_idx, :].copy()
-        # print "v_old", v_old
+        ## pick random vertex
+        v = np.random.choice(self.cmplx.vertices)
+        v_old = v.v.copy()
+        ## add random offset
         offset = self.propose_mvn.rvs()
         v_new = v_old + offset
-        # print "v_new", v_new
 
         def f_apply():           
-            # print 'before apply'
-            # self.print_vertices()
-            s.set_vertex(v_idx, v_new)
-            self.check_pointers()
-            # print 'after apply'
-            # self.print_vertices()
+            v.v = v_new
             ## proposal probabilities don't matter here
             return 0, 0
 
         def f_undo():
-            # print "v_old", v_old
-            # print 'before undo'
-            # self.print_vertices()
-            s.set_vertex(v_idx, v_old)
-            self.check_pointers()
-            # print 'after undo'
-            # self.print_vertices()
+            v.v = v_old
             return 
 
         return (f_apply, f_undo)
@@ -235,86 +242,39 @@ class BayesMesh1D(object):
         ## project random point near an obs onto Mesh
 
         o = np.random.choice(self.observations)
-        lmbda_old = o.lmbda
         s_old = o.s
 
-        offset = self.propose_mvn.rvs().reshape((self.d, 1))
+        offset = self.propose_mvn.rvs()
         pt_new = o.pt + offset
         
-        s_new, lmbda_new = self.proj(pt_new)
+        _, _, s_new = self.cmplx.proj(pt_new)
 
         def f_apply():
             o.s = s_new
-            o.lmbda = lmbda_new
             return (0, 0)
 
         def f_undo():
             o.s = s_old
-            o.lmbda = lmbda_old
             return
 
         return (f_apply, f_undo)
 
-    # def propose_simplex_birth(self):
-    #     s_idx = np.random.randint(self.N)
-    #     s = self.simplices[s_idx]
-    #     v_mid = (s.vertices[0] + s.vertices[1]) / 2
-    #     offset = self.propose_mvn.rvs()
-    #     v_new = v_mid + offset
+    ## Reversible Jump Proposals
+    def propose_vertex_death(self):
+        ## reverse is vertex_birth
+        pass
 
-    #     ll_apply = (self.propose_mvn.logpdf(offset) +
-    #                 np.log(1/self.N))
+    def propose_vertex_birth(self):
+        ## reverse is vertex_death
+        pass
 
-    #     ll_reverse = np.log(1/(self.N + 1))
-        
-    #     def f_apply():
-    #         s_new = Simplex(v_new, s.vertices[1])
-    #         self.splice(s, s_new, 1)
-    #         s_new.list_idx = self.N
-    #         self.N += 1
-    #         return ll_apply, ll_reverse
+    def propose_vertex_merge(self):
+        ## reverse is vertex_split
+        pass
 
-    #     def f_undo():
-    #         s_new = s.neighbors[1][0]
-    #         self.remove(s_new)
-    #         self.N -= 1
-    #         return
-        
-    #     return f_apply, f_undo
-
-    # def propose_simplex_death(self):
-    #     if self.N == 1:
-    #         # can't remove only simplex
-    #         f_apply = lambda : (0, 0)
-    #         f_undo = lambda: None
-    #         return f_apply, f_undo
-    #     s_idx = np.random.randint(self.N)
-    #     s = self.cmplx.simplices[s_idx]
-
-    #     # which vertex gets deleted
-    #     rm_ind = np.random.choice([0, 1])
-    #     if s.neighbors[rm_ind] is None:
-    #         # if neighbors doesn't exist swap
-    #         rm_ind = 1-rm_ind
-
-    #     v_rm = s.vertices[rm_ind]
-    #     s_adj = s.neighbors[rm_ind][0]
-        
-    #     v_keep = s.vertices[1-rm_ind]
-    #     v_connect = s_adj.vertices[rm_ind]
-
-    #     v_mid = (v_keep + v_connect) / 2
-    #     offset = v_rm - v_mid 
-
-    #     ll_reverse = (self.propose_mvn.logpdf(offset) +
-    #                 np.log(1/(self.N-1)))
-
-    #     ll_apply = np.log(1/(self.N))
-
-    #     def f_apply():
-    #         self.remove(s)
-
-    #     pass
+    def propose_vertex_split(self):
+        ## reverse is vertex_merge
+        pass
 
     def draw(self, ax=None, block=False):
         if ax is None:
@@ -328,6 +288,10 @@ class BayesMesh1D(object):
             for o in self.observations:
                 o.draw(ax)
         plt.show(block=block)
+
+
+        
+        
 
 # @profile
 def mh_step(model, f_apply, f_undo, verbose=False):
@@ -347,38 +311,71 @@ def mh_step(model, f_apply, f_undo, verbose=False):
         return 0
     return 1
 
-if __name__ == '__main__':
-    from pdb import pm, set_trace
-    # Sanity check for projections
-    # V = np.array([[0, 0], [0, 1]])
-
-    # cmplx = SimplicialComplex()
-    # vertices = [cmplx.create_vertex(x) for x in V]
-    # for i in range(len(V) - 1):
-    #     cmplx.create_simplex([i, i+1])
-
-    # obs_pts = np.array([[1, x] for x in np.linspace(-.3, 1.3)])
-    # # set_trace()
-    # # print cmplx.proj([1, -.3])
-
-    # m_gt = BayesMesh1D(obs_pts=obs_pts, cmplx=cmplx)
-    # m_gt.draw(block=True)
-    
+def create_house():
     V = np.array([[0, 0], [0, 1], [1, 2], [2, 1], [2, 0]])
 
     cmplx = SimplicialComplex()
     vertices = [cmplx.create_vertex(x) for x in V]
     for i in range(len(V) - 1):
         cmplx.create_simplex([i, i+1])
-
     
     m_gt = BayesMesh1D(cmplx=cmplx)
-    # m_gt.draw(block=True)
+    return m_gt
 
-    observed_pts = m_gt.sample_obs(500)
+def check_project():
+    # Sanity check for projections
+    V = np.array([[0, 0], [0, 1]])
 
+    cmplx = SimplicialComplex()
+    vertices = [cmplx.create_vertex(x) for x in V]
+    for i in range(len(V) - 1):
+        cmplx.create_simplex([i, i+1])
+
+    obs_pts = np.array([[1, x] for x in np.linspace(-.3, 1.3)])
+    # set_trace()
+    # print cmplx.proj([1, -.3])
+
+    m_gt = BayesMesh1D(obs_pts=obs_pts, cmplx=cmplx)
+    m_gt.draw(block=True)
+    
+
+def check_init(obs_sizes=(20, 50, 100, 500)):
+    m_gt = create_house()
+    for n_samples in obs_sizes:
+        observed_pts = m_gt.sample_obs(n_samples)
+        m_gt.set_obs(observed_pts)
+        m = BayesMesh1D(obs_pts = observed_pts)
+        print "GT LL:\t{}".format(m_gt.log_likelihood())
+        print "init LL:\t{}".format(m.log_likelihood())
+
+        m_gt.draw(block=False)
+        m.draw(block=True)
+
+def parse_arguments():
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--check_project', action='store_true')
+    parser.add_argument('--check_init', action='store_true')
+    return parser.parse_args()
+
+if __name__ == '__main__':
+    from pdb import pm, set_trace
+    args = parse_arguments()
+    if args.check_project:
+        check_project()
+
+    if args.check_init:
+        check_init()
+    
+    m_gt = create_house()
+    observed_pts = m_gt.sample_obs(50)
+    m_gt.set_obs(observed_pts)
+    gt_ll = m_gt.log_likelihood()
     m = BayesMesh1D(obs_pts = observed_pts)
-    m.draw(block=True)
+
+    m.mh(draw=20, gt_ll=gt_ll)
+
+
     
     
     # observed_pts = m_gt.sample_obs(500)

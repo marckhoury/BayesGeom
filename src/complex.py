@@ -8,6 +8,9 @@ from scipy.spatial import Delaunay
 from sklearn.cluster import KMeans
 from predicates import orient2d
 
+# number of digits to use for vertex keys
+SIG_DIGITS=8
+
 class Vertex(object):
     def __init__(self, coords):
         self.dim = len(coords)
@@ -37,10 +40,13 @@ class Vertex(object):
     def __repr__(self):
         return tuple([x for x in self.v]).__repr__()
 
+    def get_key(self):
+        return tuple(self.v.round(SIG_DIGITS))
+
 class Simplex(object):
     def __init__(self, vertices):
         self.dim = len(vertices) - 1
-        self.vertices = vertices 
+        self.vertices = vertices
         
         self._orient_positively()
         
@@ -202,6 +208,9 @@ class Simplex(object):
 
     def __ne__(self, other):
         return not self.__eq__(other)
+
+    def get_key(self):
+        return tuple(v.get_key() for v in self)
 
 class SimplicialComplex(object):
     def __init__(self):
