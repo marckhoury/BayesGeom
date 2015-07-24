@@ -262,19 +262,94 @@ class BayesMesh1D(object):
     ## Reversible Jump Proposals
     def propose_vertex_death(self):
         ## reverse is vertex_birth
-        pass
+        v = np.random.choice(self.cmplx.vertices)
+        ## probability of selecting v
+        pick_v_ll = -np.log(len(self.cmplx.vertices))
+        ## this just returns a record of the steps in the 
+        ## kill move, and the log-likelihood of any arbitrary 
+        ## decisions made
+        kill_record, kill_ll = self.cmplx.kill_vertex(v, persist=False)
+
+        ## probability we pick v's neighbor to birth v
+        pick_v_neigh_ll = -np.log(len(self.cmplx.vertices) - 1)
+        ## computes the steps of the birth_vertex method that
+        ## invert the kill record and returns the log-likelihood
+        birth_record, birth_ll = self.cmplx.birth_ll(kill_record=kill_record)
+        def f_apply():
+            self.cmplx.kill_vertex(kill_record=kill_record)
+            return pick_v_ll + kill_ll, pick_v_neigh_ll + birth_ll
+
+        def f_undo():
+            self.cmplx.birth_vertex(birth_record=birth_record)
+            return
 
     def propose_vertex_birth(self):
         ## reverse is vertex_death
-        pass
+        v = np.random.choice(self.cmplx.vertices)
+        pick_v_ll = -np.log(len(self.cmplx.vertices))
+        birth_record, birth_ll = self.cmplx.birth_vertex(v, persist=False)
+        
+        pick_v_new_ll = -np.log(len(self.cmplx.vertices) + 1)
+        kill_record, kill_ll = self.cmplx.kill_ll(birth_record=birth_record)
+        
+        def f_apply():
+            self.cmplx.birth_vertex(birth_record=birth_record)
+            return pick_v_ll + birth_ll, pick_v_new_ll + kill_ll
+
+        def f_under():
+            self.cmplx.kill_vertex(kill_record=kill_record)
+            return
 
     def propose_vertex_merge(self):
         ## reverse is vertex_split
-        pass
+        ## returns a list of holes
+        ## where each hole is a set of vertices that could possibly 
+        ## be merged
+        options = self.cmplx.merge_options()
+        hole = np.random.choice(options)
+        ## ll of selecting this hole (uniformly from the holes)
+        hole_ll = -np.log(len(options))
+        ## ll of selecting this particular u/v combo
+        pick_v_u_ll = -np.log(len(hole)) - np.log(len(hole) - 1)
+        v, u = np.random.choice(hole, 2, replace=False)
+
+        merge_record, merge_ll = self.cmplx.merge_vertex(v, u, persist=False)
+
+        ## probability we pick v's neighbor to birth v
+        pick_v_new_ll = -np.log(len(self.cmplx.vertices) - 1)
+        ## computes the steps of the birth_vertex method that
+        ## invert the kill record and returns the log-likelihood
+        split_record, split_ll = self.cmplx.split_ll(merge_record=merge_record)
+        def f_apply():
+            self.cmplx.merge_vertex(merge_record=merge_record)
+            return hole_ll + pick_u_v_ll + merge_ll, pick_v_new_ll + split_ll
+
+        def f_undo():
+            self.cmplx.split_vertex(split_record=split_record)
+            return
 
     def propose_vertex_split(self):
         ## reverse is vertex_merge
-        pass
+        v = np.random.choice(self.cmplx.vertices)
+        pick_v_ll = -np.log(len(self.cmplx.vertices))
+        split_record, split_ll = self.cmplx.split_vertex(v, persist=False)
+
+        merge_record, merge_ll = self.cmplx.merge_ll(split_record=split_record)
+
+        def f_apply():
+            ## need to compute probability of merging after changing the 
+            ## complex
+            self.cmplx.split_vertex(split_record=split_record)
+            options = self.cmplx.merge_options()
+            hole_ll = -np.log(len(options))
+            for h in options:
+                if v in h:
+                    pick_v_u_ll = -np.log(len(h)) - np.log(len(h)-1)
+                    break
+            return pick_v_ll + split_ll, hole_ll + pick_v_u_ll + merge_ll
+
+        def f_undo():
+            self.cmplx.merge_vertex(merge_record=merge_record)
 
     def draw(self, ax=None, block=False):
         if ax is None:
