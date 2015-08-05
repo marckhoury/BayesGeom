@@ -132,14 +132,14 @@ class BayesMesh1D(object):
     def prior_ll(self):
         # print 'simplex size prior', np.sum(self.prior_s_ll(s) for s in self.cmplx.simplices)
         # print 'N prior ll', self.prior_N_ll()
-        return (np.sum(self.prior_s_ll(s) for s in self.cmplx.simplices) +
+        return (np.sum(self.prior_s_ll(s) for s in self.cmplx.simplices.itervalues()) +
                 self.prior_N_ll())
 
     def sample_obs(self, n_samples):
         self.observations = []
         pts = np.zeros((n_samples, self.d))
         for i in range(n_samples):
-            s = np.random.choice(self.cmplx.simplices)
+            s = np.random.choice(self.cmplx.simplices.values())
             lmbda = np.random.rand()
             pt_src = lmbda * s.vertices[0].v + (1-lmbda) * s.vertices[1].v
             pt = self.obs_dist.rvs() + pt_src
@@ -187,8 +187,8 @@ class BayesMesh1D(object):
             plt.draw()
             raw_input('go?')
                 
-        proposals = [self.propose_vertices, self.propose_correspondence]
-        proposal_p = [.9, .1]
+        proposals = [self.propose_vertices, self.propose_correspondence, self.propose_vertex_death, self.propose_vertex_birth]
+        proposal_p = [.7, .1, .05, .15]
         accept = 0
         print self.log_likelihood()
         for i in range(samples):
@@ -196,7 +196,6 @@ class BayesMesh1D(object):
 
             # for s in self.cmplx.simplices:
             #     print s.vertices
-
             f_apply, f_undo = propose_i()
             accept_i = mh_step(self, f_apply, f_undo, verbose=False)
             accept += accept_i
@@ -220,7 +219,7 @@ class BayesMesh1D(object):
     def propose_vertices(self):
         ## symmetric
         ## pick random vertex
-        v = np.random.choice(self.cmplx.vertices)
+        v = np.random.choice(self.cmplx.vertices.values())
         v_old = v.v.copy()
         ## add random offset
         offset = self.propose_mvn.rvs()
@@ -262,19 +261,21 @@ class BayesMesh1D(object):
     ## Reversible Jump Proposals
     def propose_vertex_death(self):
         ## reverse is vertex_birth
-        v = np.random.choice(self.cmplx.vertices)
+        v = np.random.choice(self.cmplx.vertices.values())
         ## probability of selecting v
         pick_v_ll = -np.log(len(self.cmplx.vertices))
         ## this just returns a record of the steps in the 
         ## kill move, and the log-likelihood of any arbitrary 
         ## decisions made
-        kill_record, kill_ll = self.cmplx.kill_vertex(v, persist=False)
+        kill_record = self.cmplx.kill_vertex(v, persist=False)
+        kill_ll = self.cmplx.kill_ll(kill_record)
 
         ## probability we pick v's neighbor to birth v
         pick_v_neigh_ll = -np.log(len(self.cmplx.vertices) - 1)
         ## computes the steps of the birth_vertex method that
         ## invert the kill record and returns the log-likelihood
-        birth_record, birth_ll = self.cmplx.birth_ll(kill_record=kill_record)
+        birth_record = self.cmplx.birth_reverse(kill_record)
+        birth_ll = self.cmplx.birth_ll(birth_record)
         def f_apply():
             self.cmplx.kill_vertex(kill_record=kill_record)
             return pick_v_ll + kill_ll, pick_v_neigh_ll + birth_ll
@@ -282,23 +283,34 @@ class BayesMesh1D(object):
         def f_undo():
             self.cmplx.birth_vertex(birth_record=birth_record)
             return
+        return (f_apply, f_undo)
 
     def propose_vertex_birth(self):
         ## reverse is vertex_death
-        v = np.random.choice(self.cmplx.vertices)
+        v = np.random.choice(self.cmplx.vertices.values())
         pick_v_ll = -np.log(len(self.cmplx.vertices))
-        birth_record, birth_ll = self.cmplx.birth_vertex(v, persist=False)
+        
+        vec = np.random.normal(size=(self.d,)) #generate a vector uniformily over the unit sphere
+        length = np.linalg.norm(vec)
+        vec /= length
+        
+        length = np.random.uniform(0,1)
+    
+        birth_record = self.cmplx.birth_vertex(v, vec, length, persist=False)
+        birth_ll = self.cmplx.birth_ll(birth_record)
         
         pick_v_new_ll = -np.log(len(self.cmplx.vertices) + 1)
-        kill_record, kill_ll = self.cmplx.kill_ll(birth_record=birth_record)
+        kill_record = self.cmplx.kill_reverse(birth_record)
+        kill_ll = self.cmplx.kill_ll(kill_record)
         
         def f_apply():
             self.cmplx.birth_vertex(birth_record=birth_record)
             return pick_v_ll + birth_ll, pick_v_new_ll + kill_ll
 
-        def f_under():
+        def f_undo():
             self.cmplx.kill_vertex(kill_record=kill_record)
             return
+        return (f_apply, f_undo)
 
     def propose_vertex_merge(self):
         ## reverse is vertex_split
@@ -330,7 +342,7 @@ class BayesMesh1D(object):
 
     def propose_vertex_split(self):
         ## reverse is vertex_merge
-        v = np.random.choice(self.cmplx.vertices)
+        v = np.random.choice(self.cmplx.vertices.values())
         pick_v_ll = -np.log(len(self.cmplx.vertices))
         split_record, split_ll = self.cmplx.split_vertex(v, persist=False)
 
@@ -356,7 +368,7 @@ class BayesMesh1D(object):
             fig = plt.figure()
             ax = fig.add_subplot(1, 1, 1)
         ax.cla()
-        for s in self.cmplx.simplices:
+        for s in self.cmplx.simplices.itervalues():
             ((x0, y0), (x1, y1)) = s.vertices[0].v, s.vertices[1].v
             ax.plot([x0, x1], [y0, y1])
         if self.observations:

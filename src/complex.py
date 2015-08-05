@@ -31,6 +31,9 @@ class Vertex(object):
     def dist(self, u):
         return np.linalg.norm(self.v - u.as_np_array())
 
+    def translate(self, u):
+        self.v = self.v + u
+
     def __getitem__(self, i):
         return self.v[i]
 
@@ -38,8 +41,15 @@ class Vertex(object):
         return self.v.__iter__()
 
     def __repr__(self):
-        return tuple([x for x in self.v]).__repr__()
+        return self.idx.__repr__()
+        #return tuple([x for x in self.v]).__repr__()
 
+    def __eq__(self, other):
+        return np.array_equal(self.v, other.v)
+    
+    def __hash__(self):
+        return hash(self.idx)
+    
     def get_key(self):
         return tuple(self.v.round(SIG_DIGITS))
 
@@ -52,7 +62,7 @@ class Simplex(object):
         
         self.indices = tuple([v.index() for v in self.vertices])
         self.index_set = frozenset(self.indices)
-        self.neighbors = [None] * (self.dim + 1)
+        self.neighbors = {}
     
     def dimension(self):
         return self.dim
@@ -72,30 +82,48 @@ class Simplex(object):
     def facets(self):
         return [self.facet(i) for i in range(self.dim + 1)]     
 
+    def replace(self, v, u):
+        self.vertices.remove(v)
+        self.vertices.append(u)
+    
+        self._orient_positively()
+        
+        self.indices = tuple([w.index() for w in self.vertices])
+        self.index_set = frozenset(self.indices)
+            
+        if v in self.neighbors:
+            self.neighbors[u] = self.neighbors[v]
+            del self.neighbors[v]
+
     def intersect(self, s):
         face_index_set = self.index_set.intersection(s.index_set)
         face_verts = [v for v in self.vertices if v.index() in face_index_set]
         return Simplex(face_verts)  
  
-    def set_neighbor(self, s, i):
-        self.neighbors[i] = s
+    def set_neighbor(self, v, s):
+        self.neighbors[v] = s
 
-    def set_neighbor(self, s):
+    def set_neighbor_auto(self, s):
         f = self.index_set.intersection(s.index_set)
         if len(f) == self.dim:
             i = next(iter(self.index_set.difference(f)))
-            i = self.vertices.index(i)
-            self.neighbors[i] = s
+            i = self.indices.index(i)
+            v = self.vertices[i]
+            self.neighbors[v] = s
         if len(f) == s.dim:
             i = next(iter(s.index_set.difference(f)))
-            i = s.vertices.index(i)
-            s.neighbors[i] = self
+            i = s.indices.index(i)
+            v = s[i]
+            s.neighbors[v] = self
 
-    def get_neighbor(self, i):
-        return self.neighbors[i]
+    def get_neighbor(self, v):
+        try:
+            return self.neighbors[v]
+        except KeyError:
+            return None
     
     def get_neighbors(self):
-        return list(self.neighbors)
+        return self.neighbors
     
     def proj(self, p):
         min_dist = np.inf
@@ -208,14 +236,20 @@ class Simplex(object):
 
     def __ne__(self, other):
         return not self.__eq__(other)
+    
+    def __hash__(self):
+        return self.index_set.__hash__()
 
     def get_key(self):
         return tuple(v.get_key() for v in self)
 
 class SimplicialComplex(object):
     def __init__(self):
-        self.simplices = []
-        self.vertices = []
+        self.simplices = {}
+        self.simplex_set = set()
+        self.vertices = {}
+        self.stars = {}
+        self.holes = []
         self.next_vertex_index = 0
         self.next_simplex_index = 0
         self.dim = 0
@@ -223,27 +257,41 @@ class SimplicialComplex(object):
     def create_vertex(self, coords):
         v = Vertex(coords)
         v.set_index(self.next_vertex_index)
+        self.vertices[self.next_vertex_index] = v
+        self.stars[v] = set()
         self.next_vertex_index += 1
-        self.vertices.append(v)
         return v
 
     def create_simplex(self, vertex_indices):
         simp_verts = [self.vertices[i] for i in vertex_indices]
         s = Simplex(simp_verts)
-        s.set_index(self.next_simplex_index)
-        self.next_simplex_index += 1
-        self.simplices.append(s)
-    
-        if self.dim < len(vertex_indices) - 1:
-            self.dim = len(vertex_indices) - 1
-        
-        return s
+        if s not in self.simplex_set:
+            s.set_index(self.next_simplex_index)
+            self.simplices[self.next_simplex_index] = s
+            for v in simp_verts:
+                self.stars[v].add(s)
+            self.next_simplex_index += 1
+            self.simplex_set.add(s)
+            
+            if self.dim < len(vertex_indices) - 1:
+                self.dim = len(vertex_indices) - 1
+            
+            return s
+        else:
+            return None #Need to fix this, but doesn't seem like any call makes use of return value
+            
     
     def get_vertex(self, i):
-        return self.vertices[i]
+        try:
+            return self.vertices[i]
+        except KeyError:
+            return None
 
     def get_simplex(self, i):
-        return self.simplices[i]
+        try:
+            return self.simplices[i]
+        except KeyError:
+            return None
     
     def vertex_count(self):
         return len(self.vertices)
@@ -252,22 +300,19 @@ class SimplicialComplex(object):
         return len(self.simplices)
     
     def itervertices(self):
-        return self.vertices.__iter__()
+        return self.vertices.itervalues()
 
     def itersimplices(self):
-        return self.simplices.__iter__()
+        return self.simplices.itervalues()
 
     def dimension(self):
         return self.dim
 
-    def valid(self):
-        pass
-    
     def proj(self, p):
         min_dist = np.inf
         min_point = None
         min_s = None
-        for s in self.simplices:
+        for s in self.simplices.itervalues():
             d, q = s.proj(p)
             if d < min_dist:
                 min_dist = d
@@ -276,7 +321,7 @@ class SimplicialComplex(object):
         return (min_dist, min_point, min_s)
     
     def star(self, s):
-        return [t for t in self.simplices if s in t]
+        return [t for t in self.simplices.itervalues() if s in t]
     
     def link(self, s):
         link_s = []
@@ -303,15 +348,258 @@ class SimplicialComplex(object):
         else:
             raise Exception, 'initialize procedure only implemented for simplicial complexes with dimension 1-3.'
 
-    def insert_vertex(self, v, s):
+    def kill_vertex(self, v=None, persist=True, kill_record=None):
+        if kill_record is not None and 'on_the_fly' in kill_record:
+            v = self.vertices[self.next_vertex_index - 1]
+            persist = True
+            kill_record = None
+        
+        if kill_record is not None:
+            self._apply_kill_record(kill_record)
+        else:
+            kill_record = {}
+            kill_record['v'] = v
+
+            if len(self.stars[v]) > 0:
+                sv = next(iter(self.stars[v]))
+                u = sv[0] if sv[0].index() != v.index() else sv[1]
+                kill_record['u'] = u
+                kill_record['star_size'] = len(self.stars[v]) * self.dim
+                
+                destroyed_simplices = self.stars[v].intersection(self.stars[u])
+                kill_record['destroyed_simplices'] = destroyed_simplices
+            
+                kill_record['neighbor_updates'] = []
+                for s in destroyed_simplices:
+                    vn = s.get_neighbor(v)
+                    un = s.get_neighbor(u)
+                    w, y, = None, None 
+                    if vn is not None:
+                        w = next(iter(vn.index_set.difference(s.index_set)))
+                        w = vn.indices.index(w)
+                        w = vn[w]
+                    if un is not None:
+                        y = next(iter(un.index_set.difference(s.index_set)))
+                        y = un.indices.index(y)
+                        y = un[y]
+                
+                    kill_record['neighbor_updates'].append((vn, w, un, y)) 
+            else:
+                kill_record['u'] = None
+                kill_record['star_size'] = 0
+                kill_record['destroyed_simplices'] = []
+                kill_record['neighbor_updates'] = []
+            
+            if persist:
+                self._apply_kill_record(kill_record)
+            return kill_record
+    
+    def kill_reverse(self, birth_record):
+        #Constructing this kill_record is a little difficult
+        #sice the vertex to kill hasn't been created yet, in this case
+        #so I'm going to do something hacky
+        #I'll create a kill_record with enough info to compute the log likelihood
+        #based on the state assuming the birth_record has been applied
+        #Then I'll include a field called 'on_the_fly' so when 
+        #apply_kill_record is called with this record
+        #it will compute the appropriate kill_record then and there
+        #using the most recently created vertex
+        kill_record = {}
+        kill_record['on_the_fly'] = True
+        
+        #size of the star of the newly created vertex
+        star_size = len(birth_record['new_simplices']) + len(birth_record['update_simplices']) 
+    
+        #number of vertices to possibly collapse into for the newly created star
+        kill_record['star_size'] = star_size * self.dim
+        
+        return kill_record
+    
+    def kill_ll(self, kill_record):
+        return -np.log(kill_record['star_size'])
+    
+    def birth_vertex(self, v=None, vec=None, length=None, persist=True, birth_record=None):
+        if birth_record is not None:
+            self._apply_birth_record(birth_record)
+        else:
+            birth_record = {}
+            birth_record['v'] = v
+            birth_record['dir'] = vec
+            birth_record['star_size'] = len(self.stars[v])
+            birth_record['new_simplices'] = []
+            birth_record['update_simplices'] = []
+            
+            min_dist = np.inf    
+            for s in self.stars[v]:
+                for u in s:
+                    dist = v.dist(u)
+                    if u.index() != v.index() and dist < min_dist:
+                        min_dist = dist
+            birth_record['length'] = length if length <= min_dist else min_dist     
+ 
+            pos = v.as_np_array() + birth_record['length'] * vec
+            
+            min_dist = np.inf
+            min_simp = None 
+            for s in self.stars[v]:
+                dist, _ = s.proj(pos)
+                if dist < min_dist:
+                    min_dist = dist
+                    min_simp = s
+           
+            if min_simp is not None:
+                u = min_simp[0] if min_simp[0].index() != v.index() else min_simp[1]
+                to_update = self.stars[v].intersection(self.stars[u])
+                for s in to_update:
+                    birth_record['update_simplices'].append(s)
+                    index_set = [w.index() for w in s if w.index() != u.index()]
+                    birth_record['new_simplices'].append(index_set)
+            else:
+                birth_record['new_simplices'].append([v.index()])     
+         
+            if persist:
+                self._apply_birth_record(birth_record)
+            return birth_record
+
+    def birth_reverse(self, kill_record):
+        birth_record = {}
+        v, u = kill_record['v'], kill_record['u']
+        birth_record['v'] = u
+        birth_record['star_size'] = len(self.stars[v])
+         
+        vec = v.as_np_array() - u.as_np_array()
+        length = np.linalg.norm(vec)
+        birth_record['dir'] = vec/length
+        birth_record['length'] = length
+      
+        birth_record['new_simplices'] = []
+        for s in kill_record['destroyed_simplices']:
+            index_set = [w.index() for w in s if w.index() != v.index()]
+            birth_record['new_simplices'].append(index_set) 
+    
+        birth_record['update_simplices'] = [] 
+        for s in kill_record['destroyed_simplices']:
+            t = s.get_neighbor(kill_record['u'])
+            if t is not None:
+                birth_record['update_simplices'].append(t)
+                
+        return birth_record
+ 
+    def birth_ll(self, birth_record):
+        return -np.log(birth_record['star_size']) 
+    
+    def merge_options(self):
+        if self.dim == 1:
+            return self.holes[0]
+    
+    def merge_vertex(self, v=None, u=None, persist=False, merge_record=None):
+        if merge_record is not None:
+            self._apply_merge_record(merge_record)
+        elif self.dim == 1:
+            merge_record = {}
+            merge_record['v'] = v
+            merge_record['u'] = u
+            
+            sv = self.stars[v][0]
+            su = self.stars[u][0]
+            
+            nv = sv[0] if sv[0].index() != v.index() else sv[1]
+            nu = su[0] if su[0].indeX() != u.index() else nu[1]
+            
+            merge_record['neighbor_updates'].append((sv, nv, su, nu))
+            
+            if persist:
+                self._apply_merge_record(merge_record)
+            return merge_record
+    
+    def merge_ll(self, merge_record):
         pass
     
-    def remove_vertex(self, v):
-        pass
+    def split_vertex(self, v, persist=False, split_record=None):
+        if split_record is not None:
+            self._apply_split_record(split_record)
+        elif self.dim == 1:
+            split_record = {}
+            split_record['v'] = v
+            split_record['s'] = self.stars[v][0]
+            split_record['t'] = self.stars[v][1] if len(self.stars[v]) > 1 else None
+            split_record['star_size'] = len(self.stars[v]) 
+             
+            if persist:
+                self._appply_split_record(split_record)
+            return split_record
+    
+    def split_ll(self, split_record):
+        pass  
         
-    def translate_vertex(self, coords):
-        pass
-   
+    def translate_vertex(self, v, coords):
+        v.translate(coords)
+  
+    def _apply_kill_record(self, kill_record):
+        for update in kill_record['neighbor_updates']:
+            vn, w, un, x = update
+            if vn is not None:
+                vn.set_neighbor(w, un)
+            if un is not None:
+                un.set_neighbor(x, vn)
+
+        for s in kill_record['destroyed_simplices']:
+            for w in s:
+                self.stars[w].remove(s)
+            t = s.get_neighbor(kill_record['u'])
+            if t is not None:
+                for x in t:
+                    self.stars[x].remove(t)
+                t.replace(kill_record['v'], kill_record['u'])
+                for x in t:
+                    self.stars[x].add(t)
+            del self.simplices[s.index()]
+        del self.stars[kill_record['v']]    
+        del self.vertices[kill_record['v'].index()]
+            
+    def _apply_birth_record(self, birth_record):
+        v = birth_record['v']
+        u = v.as_np_array() + birth_record['length'] * birth_record['dir']
+        u = self.create_vertex(u) 
+        
+        for s in birth_record['new_simplices']:
+            s.append(u.index())
+            self.create_simplex(s)
+    
+        for s in birth_record['update_simplices']:
+            for w in s:
+                self.stars[w].remove(s)
+            s.replace(v, u)
+            for w in s:
+                self.stars[w].add(s)
+    
+        modified = self.stars[v].union(self.stars[u])
+        
+        for s in modified:
+            for t in modified:
+                s.set_neighbor_auto(t)
+    
+    def _apply_merge_record(self, merge_record):
+        for update in merge_record['neighbor_updates']:
+            sv, nv, su, nu = update
+            sv.set_neighbor(nv, su)
+            su.set_neighbor(nu, sv)
+            su.replace(nu, nv)
+            del self.vertices[nu.index()]
+            del self.stars[nu]
+
+    def _apply_split_record(self, split_record):
+        v = split_record['v']
+        v_coords = v.as_np_array()
+        w = self.create_vertex(v_coords)
+        for update in split_record['neighbor_updates']:
+            sv, nv, su, nu = update
+            sv.set_neighbor(nv, None)
+            su.set_neighbor(nu, None)
+            su.replace(v, w)
+            self.stars[w].add(su)
+            self.stars[v].remove(su)
+    
     def _construct_curve(self, points):
         delaunay = Delaunay(points)
         indices, indptr = delaunay.vertex_neighbor_vertices
@@ -324,6 +612,10 @@ class SimplicialComplex(object):
             for j in edge_table[i]:
                 if j != None and i in edge_table[j]:
                     self.create_simplex([i,j])
+        for s in self.simplices.values():
+            for t in self.simplices.values():
+                s.set_neighbor_auto(t)
+             
             
     def _get_curve_edges(self, points, i, neighbors):
         min_dist = np.inf
@@ -369,7 +661,7 @@ if __name__ == '__main__':
     s = Simplex([v1,v3,v2])
     t = Simplex([v1,v2,v3])
     print s.intersect(t)
-    s.set_neighbor(t)
+    s.set_neighbor_auto(t)
     print s.get_neighbors()
     print t.get_neighbors()
     v = Vertex([0,1,3,1])
