@@ -14,6 +14,9 @@ eps = 1e-8
 
 MAX_CACHE_SIZE=20
 
+RJ_COR_ALPHA=50
+COR_ALPHA=1
+
 class Obs(object):
     
     """
@@ -53,13 +56,17 @@ class Obs(object):
             self._proj_cache[s_key] = (self.dist, self.q)
         return self.dist, self.q
 
+    def __repr__(self):
+        return "Obs({},{})".format(self.pt, self.s)
+
     
 
             
     # @profile
     def log_likelihood(self):
         self.proj()
-        return self.noise_dist.logpdf(self.dist)
+        ## prob of noise from source + probability of selecting source
+        return self.noise_dist.logpdf(self.dist) - np.log(self.s.area())
 
     def set_source(self, s):
         self.s = s
@@ -83,8 +90,8 @@ class BayesMesh1D(object):
 
     places a generic prior on complexes
     """
-    def __init__(self, obs_pts=None, cmplx=None, gamma=.2, lmbda=.5, obs_sigma=.05, propose_sigma=.05,
-                 d=2, obs=None, N=None, P=None):
+    def __init__(self, obs_pts=None, cmplx=None, gamma=.99, lmbda=.5, obs_sigma=.05, propose_sigma=.005,
+                 d=2, obs=None, N=None, P=None, n_clusters_init=5):
         """
         gamma: geometric variable for prior on number of simplices
         sigma_sq: variance of 
@@ -101,14 +108,14 @@ class BayesMesh1D(object):
         self.len_prior = expon(self.lmbda)
 
         self.propose_mvn = mvn(np.zeros(self.d), propose_sigma*np.eye(self.d))
-        self.obs_dist = mvn(np.zeros(self.d), obs_sigma*np.eye(self.d))
+        self.obs_dist = norm(loc=0, scale=obs_sigma)
 
         self.cmplx = cmplx
         if self.cmplx is None:
             # obs_pts is not None
             self.cmplx = SimplicialComplex()
             ## this is a 1d complex
-            self.cmplx.initialize(obs_pts, 1)
+            self.cmplx.initialize(obs_pts, 1, n_clusters=n_clusters_init)
 
         self.N = self.cmplx.simplex_count()
 
@@ -138,11 +145,22 @@ class BayesMesh1D(object):
     def sample_obs(self, n_samples):
         self.observations = []
         pts = np.zeros((n_samples, self.d))
+        simplices = self.cmplx.simplices.values()
+        p_simplex = [s.area() for s in simplices]
+        total_area = np.sum(p_simplex)
+        p_simplex =[p/total_area for p in p_simplex]
         for i in range(n_samples):
-            s = np.random.choice(self.cmplx.simplices.values())
+            s = np.random.choice(simplices, p=p_simplex)
             lmbda = np.random.rand()
             pt_src = lmbda * s.vertices[0].v + (1-lmbda) * s.vertices[1].v
-            pt = self.obs_dist.rvs() + pt_src
+            ## compute normal direction
+            normal = s.vertices[0].v - s.vertices[1].v
+            normal[0], normal[1] = normal[1], normal[0]
+            normal = normal / np.linalg.norm(normal)
+            normal[1] *= -1
+            delta = self.obs_dist.rvs()
+            pt = delta*normal + pt_src
+            # print pt_src, pt, delta, normal
             pts[i, :] = pt
             self.observations.append(Obs(pt, self.cmplx))
         return pts
@@ -159,9 +177,14 @@ class BayesMesh1D(object):
 
     def obs_ll(self):
         ll = 0
+        simplices = self.cmplx.simplices.values()
+        p_simplex = np.array([s.area() for s in simplices])
+        p_simplex = np.log(p_simplex) - np.log(np.sum(p_simplex))
+        p_simplex = dict(zip(simplices, p_simplex))
         for o in self.observations:
             ## need to compute distance to observation
             ll += o.log_likelihood()
+            ll += p_simplex[o.s]
         return ll
 
     # @profile
@@ -172,43 +195,80 @@ class BayesMesh1D(object):
         return prior_ll + obs_ll
 
     # @profile
-    def mh(self, samples=500, draw=False, gt_ll=None):
+    def mh(self, samples=5000, draw=False, gt_ll=None, gt_structure_ll=None):
         if draw:
-            fig, axarr = plt.subplots(2)
+            fig, axarr = plt.subplots(3)
             axarr[1].set_title('Log-Likelihood')
+            axarr[2].set_title('Stucture Log-Likelihood')
             log_likelihoods = [self.log_likelihood()]
+            prior_ll = [self.prior_ll()]
+
             l_mcmc,  = axarr[1].plot(range(len(log_likelihoods)), log_likelihoods, label='MCMC')
+
             if gt_ll:
                 gt_ll_arr = np.ones(samples+1)*gt_ll
                 l_gt,  = axarr[1].plot(range(samples+1), gt_ll_arr, label='Ground Truth')
+            axarr[1].legend(loc='best')
 
-            plt.legend(loc='best')
+            l_prior_ll,  = axarr[2].plot(range(len(prior_ll)), prior_ll, label='Stucture_LL')
+            if gt_structure_ll:
+                gt_struct_ll_arr = np.ones(samples+1)*gt_structure_ll
+                l_gt_struct = axarr[2].plot(range(samples+1), gt_struct_ll_arr, label="GT_Structure_LL")
+
+            axarr[2].legend(loc='best')
             plt.show(block=False)
             plt.draw()
-            raw_input('go?')
+            # raw_input('go?')
                 
-        proposals = [self.propose_vertices, self.propose_correspondence, self.propose_vertex_death, self.propose_vertex_birth]
-        proposal_p = [.7, .1, .05, .15]
+        proposals = ['vertices', 'correspondence', 'death', 'birth']
+
+        accepts = {}
+        for p in proposals:
+            accepts[p] = (0, 0)
+
+        proposal_p = [.3, .6, .05, .05]
+
+        proposal_fns = {'vertices':self.propose_vertices, 
+                     'correspondence':self.propose_correspondence, 
+                     'death':self.propose_vertex_death, 
+                     'birth':self.propose_vertex_birth}
+
+        # proposal_p = [0, 0, 1, 0]
         accept = 0
+
         print self.log_likelihood()
         for i in range(samples):
             propose_i = np.random.choice(proposals, p=proposal_p)
 
             # for s in self.cmplx.simplices:
             #     print s.vertices
-            f_apply, f_undo = propose_i()
-            accept_i = mh_step(self, f_apply, f_undo, verbose=False)
-            accept += accept_i
+            f_apply, f_undo = proposal_fns[propose_i]()
+            # set_trace()
+            accept_i = mh_step(self, f_apply, f_undo, verbose=False)   
+            accepts[propose_i] = (accepts[propose_i][0] + accept_i, accepts[propose_i][1]+1)
             # print 'accepted', accept_i, self.log_likelihood()
             # if np.isnan(self.log_likelihood()):
             #     import pdb; pdb.set_trace()
             log_likelihoods.append(self.log_likelihood())
+            prior_ll.append(self.prior_ll())
+            
+            # print self.log_likelihood(), propose_i, accept_i
             if draw and i%draw == 0:
-                print "accept rate", accept / (i+1)                
+                accept_str = ""
+                for p, (accept_p, attempt_p) in accepts.iteritems():
+                    if attempt_p == 0:
+                        continue
+                    accept_str += "{}:\t {:.3}\t".format(p, accept_p / attempt_p)
+                print accept_str
                 l_mcmc.set_data(range(len(log_likelihoods)), log_likelihoods)
+                l_prior_ll.set_data(range(len(prior_ll)), prior_ll)
+                axarr[2].set_ylim(np.min(prior_ll), max(0, np.max(prior_ll), gt_structure_ll))
+                axarr[1].set_ylim(np.min(log_likelihoods), max(0, np.max(log_likelihoods)+50, gt_ll+50))
                 self.draw(block=False, ax=axarr[0])
                 plt.draw()
                 time.sleep(.1)
+            for o in self.observations:
+                assert o.s in self.cmplx.simplices.values()
 
         if draw:
             l_mcmc.set_data(range(len(log_likelihoods)), log_likelihoods)
@@ -217,6 +277,8 @@ class BayesMesh1D(object):
         
     # @profile            
     def propose_vertices(self):
+        ## TODO: update to ensure no local overlaps
+        ## similar to the way that we need to deal with the RJ steps
         ## symmetric
         ## pick random vertex
         v = np.random.choice(self.cmplx.vertices.values())
@@ -236,6 +298,21 @@ class BayesMesh1D(object):
 
         return (f_apply, f_undo)
 
+    def propose_simplex(self, o, alpha=10):
+        distances = self.cmplx.simplex_dists(o.pt)
+        
+        simplices = []
+        probs = np.zeros(len(distances))
+
+        for i, s in enumerate(distances.keys()):
+            simplices.append(s)
+            probs[i] = np.exp(-alpha*distances[s])
+
+        probs /= np.sum(probs)
+
+        s_new = np.random.choice(simplices, p=probs)
+        return dict(zip(simplices, probs)), s_new
+
     # @profile
     def propose_correspondence(self):
         ## project random point near an obs onto Mesh
@@ -243,14 +320,13 @@ class BayesMesh1D(object):
         o = np.random.choice(self.observations)
         s_old = o.s
 
-        offset = self.propose_mvn.rvs()
-        pt_new = o.pt + offset
-        
-        _, _, s_new = self.cmplx.proj(pt_new)
-
+        probs, s_new = self.propose_simplex(o, alpha=COR_ALPHA)
+        p_new = np.log(probs[s_new])
+        p_old = np.log(probs[s_old])
+    
         def f_apply():
             o.s = s_new
-            return (0, 0)
+            return (p_new, p_old)
 
         def f_undo():
             o.s = s_old
@@ -258,8 +334,13 @@ class BayesMesh1D(object):
 
         return (f_apply, f_undo)
 
+
+
     ## Reversible Jump Proposals
     def propose_vertex_death(self):
+        # import pdb; pdb.set_trace()
+        if self.N == 1:
+            return self.propose_vertices()
         ## reverse is vertex_birth
         v = np.random.choice(self.cmplx.vertices.values())
         ## probability of selecting v
@@ -270,22 +351,51 @@ class BayesMesh1D(object):
         kill_record = self.cmplx.kill_vertex(v, persist=False)
         kill_ll = self.cmplx.kill_ll(kill_record)
 
+        ## likelihood of selecting that length
+        len_ll = self.len_prior.logpdf(v.dist(kill_record['u']) + 1)
+
         ## probability we pick v's neighbor to birth v
         pick_v_neigh_ll = -np.log(len(self.cmplx.vertices) - 1)
         ## computes the steps of the birth_vertex method that
         ## invert the kill record and returns the log-likelihood
         birth_record = self.cmplx.birth_reverse(kill_record)
         birth_ll = self.cmplx.birth_ll(birth_record)
+
+        ## compute observations to reassign to simplices
+        # obs_to_move = [o for o in self.observations if o.s in self.cmplx.stars[v]]
+        obs_to_move = self.observations
+        obs_undo = []
+        coresp_undo_ll = 0
+        for o in obs_to_move:
+            obs_undo.append((o, o.s, o.s.get_key()))
+            p_undo, _ = self.propose_simplex(o, alpha=RJ_COR_ALPHA)
+            coresp_undo_ll += np.log(p_undo[o.s])
+
         def f_apply():
             self.cmplx.kill_vertex(kill_record=kill_record)
-            return pick_v_ll + kill_ll, pick_v_neigh_ll + birth_ll
+            coresp_apply_ll = 0
+            for o in obs_to_move:
+                p_reassign, s_new = self.propose_simplex(o, alpha=RJ_COR_ALPHA)
+                coresp_apply_ll += np.log(p_reassign[s_new])
+                o.s = s_new
+            self.N -= 1
+            # set_trace()
+            return (pick_v_ll + kill_ll + coresp_apply_ll, 
+                    pick_v_neigh_ll + birth_ll + coresp_undo_ll + len_ll)
 
         def f_undo():
             self.cmplx.birth_vertex(birth_record=birth_record)
+            replace_simps = {}
+            for o, s_old, s_old_key in obs_undo:
+                ## deal with the fact that pointers might point to dead
+                ## simplices now                
+                o.s = self.cmplx.get_simplex_by_key(s_old_key, replace_simps)
+            self.N += 1
             return
         return (f_apply, f_undo)
 
     def propose_vertex_birth(self):
+        # import pdb; pdb.set_trace()
         ## reverse is vertex_death
         v = np.random.choice(self.cmplx.vertices.values())
         pick_v_ll = -np.log(len(self.cmplx.vertices))
@@ -294,7 +404,9 @@ class BayesMesh1D(object):
         length = np.linalg.norm(vec)
         vec /= length
         
-        length = np.random.uniform(0,1)
+        # subtract 1 b/c prior is over [1, \infty)
+        length = self.len_prior.rvs() - 1
+        len_ll = self.len_prior.logpdf(length + 1)
     
         birth_record = self.cmplx.birth_vertex(v, vec, length, persist=False)
         birth_ll = self.cmplx.birth_ll(birth_record)
@@ -302,13 +414,43 @@ class BayesMesh1D(object):
         pick_v_new_ll = -np.log(len(self.cmplx.vertices) + 1)
         kill_record = self.cmplx.kill_reverse(birth_record)
         kill_ll = self.cmplx.kill_ll(kill_record)
+
+        ## reassign observations that point to simplices 
+        ## that will change
+        # obs_to_move = [o for o in self.observations if o.s in self.cmplx.stars[v]]
+        obs_to_move = self.observations
+        # print v, len(obs_to_move)
+        obs_undo = []
+        coresp_undo_ll = 0
+        for o in obs_to_move:
+            obs_undo.append((o, o.s, o.s.get_key()))
+            assert o.s in self.cmplx.simplices.values()
+            p_undo, _ = self.propose_simplex(o, alpha=RJ_COR_ALPHA)
+            coresp_undo_ll += np.log(p_undo[o.s])
         
         def f_apply():
+            # self.draw()
+            # set_trace()
             self.cmplx.birth_vertex(birth_record=birth_record)
-            return pick_v_ll + birth_ll, pick_v_new_ll + kill_ll
+            coresp_apply_ll = 0
+            for o in obs_to_move:
+                p_reassign, s_new = self.propose_simplex(o, alpha=RJ_COR_ALPHA)
+                o.s = s_new
+                coresp_apply_ll += np.log(p_reassign[s_new])
+                # print p_reassign, s_new, self.cmplx.simplex_dists(o.pt)
+            # self.log_likelihood()
+            # self.draw(block=True)
+            self.N += 1
+            return (pick_v_ll + birth_ll + coresp_apply_ll + len_ll, 
+                    pick_v_new_ll + kill_ll + coresp_undo_ll)
 
         def f_undo():
             self.cmplx.kill_vertex(kill_record=kill_record)
+            replace_simps = {}
+            for o, s_old, s_old_key in obs_undo:
+                o.s = self.cmplx.get_simplex_by_key(s_old_key, replace_simps)
+                assert o.s in self.cmplx.simplices.values()
+            self.N -= 1
             return
         return (f_apply, f_undo)
 
@@ -443,6 +585,7 @@ def parse_arguments():
     parser = argparse.ArgumentParser()
     parser.add_argument('--check_project', action='store_true')
     parser.add_argument('--check_init', action='store_true')
+    parser.add_argument('--n_clusters', type=int, default=5)
     return parser.parse_args()
 
 if __name__ == '__main__':
@@ -455,12 +598,13 @@ if __name__ == '__main__':
         check_init()
     
     m_gt = create_house()
-    observed_pts = m_gt.sample_obs(50)
+    observed_pts = m_gt.sample_obs(100)
     m_gt.set_obs(observed_pts)
     gt_ll = m_gt.log_likelihood()
-    m = BayesMesh1D(obs_pts = observed_pts)
+    gt_struct_ll = m_gt.prior_ll()
+    m = BayesMesh1D(obs_pts = observed_pts, n_clusters_init=args.n_clusters)
 
-    m.mh(draw=20, gt_ll=gt_ll)
+    m.mh(draw=20, gt_ll=gt_ll, gt_structure_ll=gt_struct_ll)
 
 
     

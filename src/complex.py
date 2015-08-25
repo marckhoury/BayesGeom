@@ -41,7 +41,7 @@ class Vertex(object):
         return self.v.__iter__()
 
     def __repr__(self):
-        return self.idx.__repr__()
+        return "V({}, {})".format(self.idx.__repr__(), self.get_key())
         #return tuple([x for x in self.v]).__repr__()
 
     def __eq__(self, other):
@@ -241,13 +241,20 @@ class Simplex(object):
         return self.index_set.__hash__()
 
     def get_key(self):
-        return tuple(v.get_key() for v in self)
+        return tuple(sorted(v.get_key() for v in self))
+
+    def area(self):
+        if self.dim == 1:
+            return self.vertices[0].dist(self.vertices[1])
+        raise NotImplemented
 
 class SimplicialComplex(object):
     def __init__(self):
         self.simplices = {}
         self.simplex_set = set()
         self.vertices = {}
+        ## Maps vertices to the set of simplices
+        ## that contain it
         self.stars = {}
         self.holes = []
         self.next_vertex_index = 0
@@ -279,6 +286,16 @@ class SimplicialComplex(object):
             return s
         else:
             return None #Need to fix this, but doesn't seem like any call makes use of return value
+
+    def get_simplex_by_key(self, s_key, replace_dict=None):
+        # import pdb; pdb.set_trace()
+        if replace_dict is not None and s_key in replace_dict:
+            return replace_dict[s_key]
+        for t in self.simplices.itervalues():
+            if t.get_key() == s_key:
+                replace_dict[s_key] = t
+                return t
+        raise KeyError
             
     
     def get_vertex(self, i):
@@ -319,6 +336,12 @@ class SimplicialComplex(object):
                 min_point = q
                 min_s = s
         return (min_dist, min_point, min_s)
+
+    def simplex_dists(self, p):
+        res = {}
+        for s in self.simplices.itervalues():
+            res[s] = s.proj(p)[0]
+        return res
     
     def star(self, s):
         return [t for t in self.simplices.itervalues() if s in t]
@@ -331,9 +354,9 @@ class SimplicialComplex(object):
                     link_s.append(f)
         return link_s
 
-    def initialize(self, points, d):
+    def initialize(self, points, d,n_clusters=8):
         n = points.shape[0]
-        kmeans = KMeans(init="k-means++", n_clusters=int(5))
+        kmeans = KMeans(init="k-means++", n_clusters=int(n_clusters))
         kmeans.fit(points)
         centroids = kmeans.cluster_centers_
         for i in xrange(0, centroids.shape[0]):
@@ -347,6 +370,19 @@ class SimplicialComplex(object):
             self._construct_volume(centroids)
         else:
             raise Exception, 'initialize procedure only implemented for simplicial complexes with dimension 1-3.'
+        ## remove any leftover vertices that aren't in simplices
+        to_del = []
+        for i, v in self.vertices.iteritems():
+            used=False
+            for s in self.simplices.itervalues():
+                if v in s:
+                    used=True
+                    break
+            if not used:
+                to_del.append(v)
+        for v in to_del:
+            del self.stars[v]
+            del self.vertices[v.index()]
 
     def kill_vertex(self, v=None, persist=True, kill_record=None):
         if kill_record is not None and 'on_the_fly' in kill_record:
@@ -435,7 +471,7 @@ class SimplicialComplex(object):
                     dist = v.dist(u)
                     if u.index() != v.index() and dist < min_dist:
                         min_dist = dist
-            birth_record['length'] = length if length <= min_dist else min_dist     
+            birth_record['length'] = length if length <= min_dist else min_dist
  
             pos = v.as_np_array() + birth_record['length'] * vec
             
