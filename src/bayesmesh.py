@@ -14,8 +14,13 @@ eps = 1e-8
 
 MAX_CACHE_SIZE=20
 
-RJ_COR_ALPHA=50
-COR_ALPHA=1
+RJ_COR_ALPHA=100
+COR_ALPHA=50
+OBS_SIGMA=.01
+
+P_RESTRICT_AFFINE = 0.3
+
+
 
 class Obs(object):
     
@@ -25,7 +30,7 @@ class Obs(object):
     eventually, these will generate the actual observations
     """
     
-    def __init__(self, pt, cmplx, sigma=.05, s_source=None):
+    def __init__(self, pt, cmplx, sigma=OBS_SIGMA, s_source=None):
         """
         pt: position of the point
         s_source: pointer to simplex that generated point
@@ -90,7 +95,7 @@ class BayesMesh1D(object):
 
     places a generic prior on complexes
     """
-    def __init__(self, obs_pts=None, cmplx=None, gamma=.99, lmbda=.5, obs_sigma=.05, propose_sigma=.005,
+    def __init__(self, obs_pts=None, cmplx=None, gamma=.9, lmbda=.2, obs_sigma=OBS_SIGMA, propose_sigma=.001, birth_sigma=.1,
                  d=2, obs=None, N=None, P=None, n_clusters_init=5):
         """
         gamma: geometric variable for prior on number of simplices
@@ -110,6 +115,8 @@ class BayesMesh1D(object):
         self.propose_mvn = mvn(np.zeros(self.d), propose_sigma*np.eye(self.d))
         self.obs_dist = norm(loc=0, scale=obs_sigma)
 
+        self.birth_proposal = norm(loc=lmbda, scale=birth_sigma)
+
         self.cmplx = cmplx
         if self.cmplx is None:
             # obs_pts is not None
@@ -123,7 +130,7 @@ class BayesMesh1D(object):
 #            self.sample_obs(self.N * 10)
             self.sample_obs(self.N * 100)
         else:
-            self.observations = []                        
+            self.observations = []
             for pt in obs_pts:
                 self.observations.append(Obs(pt, self.cmplx))
             
@@ -195,7 +202,7 @@ class BayesMesh1D(object):
         return prior_ll + obs_ll
 
     # @profile
-    def mh(self, samples=5000, draw=False, gt_ll=None, gt_structure_ll=None):
+    def mh(self, samples=5000, draw=False, gt_ll=None, gt_structure_ll=None, final_block=False):
         if draw:
             fig, axarr = plt.subplots(3)
             axarr[1].set_title('Log-Likelihood')
@@ -209,6 +216,7 @@ class BayesMesh1D(object):
                 gt_ll_arr = np.ones(samples+1)*gt_ll
                 l_gt,  = axarr[1].plot(range(samples+1), gt_ll_arr, label='Ground Truth')
             axarr[1].legend(loc='best')
+            axarr[1].set_xlim(0, samples+1)
 
             l_prior_ll,  = axarr[2].plot(range(len(prior_ll)), prior_ll, label='Stucture_LL')
             if gt_structure_ll:
@@ -216,6 +224,7 @@ class BayesMesh1D(object):
                 l_gt_struct = axarr[2].plot(range(samples+1), gt_struct_ll_arr, label="GT_Structure_LL")
 
             axarr[2].legend(loc='best')
+            axarr[2].set_xlim(0, samples+1)
             plt.show(block=False)
             plt.draw()
             # raw_input('go?')
@@ -262,8 +271,14 @@ class BayesMesh1D(object):
                 print accept_str
                 l_mcmc.set_data(range(len(log_likelihoods)), log_likelihoods)
                 l_prior_ll.set_data(range(len(prior_ll)), prior_ll)
-                axarr[2].set_ylim(np.min(prior_ll), max(0, np.max(prior_ll), gt_structure_ll))
-                axarr[1].set_ylim(np.min(log_likelihoods), max(0, np.max(log_likelihoods)+50, gt_ll+50))
+                if gt_structure_ll is not None:
+                    axarr[2].set_ylim(np.min(prior_ll), max(0, np.max(prior_ll), gt_structure_ll))
+                else:
+                    axarr[2].set_ylim(np.min(prior_ll), max(0, np.max(prior_ll)))
+                if gt_ll is not None:
+                    axarr[1].set_ylim(np.min(log_likelihoods), max(0, np.max(log_likelihoods)+50, gt_ll+50))
+                else:
+                    axarr[1].set_ylim(np.min(log_likelihoods), max(0, np.max(log_likelihoods)+50))
                 self.draw(block=False, ax=axarr[0])
                 plt.draw()
                 time.sleep(.1)
@@ -272,7 +287,7 @@ class BayesMesh1D(object):
 
         if draw:
             l_mcmc.set_data(range(len(log_likelihoods)), log_likelihoods)
-            self.draw(block=True, ax=axarr[0])
+            self.draw(block=final_block, ax=axarr[0])
             
         
     # @profile            
@@ -285,7 +300,24 @@ class BayesMesh1D(object):
         v_old = v.v.copy()
         ## add random offset
         offset = self.propose_mvn.rvs()
+
+
         v_new = v_old + offset
+        v_dist = np.linalg.norm(v_new - v_old)
+        # print offset, v_new, v_dist
+        if np.random.rand() > P_RESTRICT_AFFINE:
+            v_star = tuple(self.cmplx.stars[v])
+            s = np.random.choice(v_star)
+            Q, o = s._affine_hull()
+            q = v_new - o
+            lc = np.dot(Q, q)
+            v_new = s._pos_in_space(Q, lc) + o
+            v_dist2 = np.linalg.norm(v_new - v_old)
+            # print v_new, np.linalg.norm(v_new - v_old)
+            if v_dist < v_dist2:
+                print v_dist2 - v_dist
+                import pdb; pdb.set_trace()
+
 
         def f_apply():           
             v.v = v_new
@@ -298,7 +330,7 @@ class BayesMesh1D(object):
 
         return (f_apply, f_undo)
 
-    def propose_simplex(self, o, alpha=10):
+    def propose_simplex(self, o):
         distances = self.cmplx.simplex_dists(o.pt)
         
         simplices = []
@@ -306,12 +338,13 @@ class BayesMesh1D(object):
 
         for i, s in enumerate(distances.keys()):
             simplices.append(s)
-            probs[i] = np.exp(-alpha*distances[s])
+            probs[i] = self.obs_dist.pdf(distances[s])
 
         probs /= np.sum(probs)
 
         s_new = np.random.choice(simplices, p=probs)
-        return dict(zip(simplices, probs)), s_new
+        res = dict(zip(simplices, probs))
+        return res, s_new
 
     # @profile
     def propose_correspondence(self):
@@ -320,7 +353,7 @@ class BayesMesh1D(object):
         o = np.random.choice(self.observations)
         s_old = o.s
 
-        probs, s_new = self.propose_simplex(o, alpha=COR_ALPHA)
+        probs, s_new = self.propose_simplex(o)
         p_new = np.log(probs[s_new])
         p_old = np.log(probs[s_old])
     
@@ -352,7 +385,7 @@ class BayesMesh1D(object):
         kill_ll = self.cmplx.kill_ll(kill_record)
 
         ## likelihood of selecting that length
-        len_ll = self.len_prior.logpdf(v.dist(kill_record['u']) + 1)
+        len_ll = self.birth_proposal.logpdf(v.dist(kill_record['u']))
 
         ## probability we pick v's neighbor to birth v
         pick_v_neigh_ll = -np.log(len(self.cmplx.vertices) - 1)
@@ -366,20 +399,34 @@ class BayesMesh1D(object):
         obs_to_move = self.observations
         obs_undo = []
         coresp_undo_ll = 0
+        undo_lls = []
         for o in obs_to_move:
             obs_undo.append((o, o.s, o.s.get_key()))
-            p_undo, _ = self.propose_simplex(o, alpha=RJ_COR_ALPHA)
+            p_undo, _ = self.propose_simplex(o)
             coresp_undo_ll += np.log(p_undo[o.s])
+            undo_lls.append(p_undo[o.s])
 
         def f_apply():
+            old_ll = self.log_likelihood()
             self.cmplx.kill_vertex(kill_record=kill_record)
             coresp_apply_ll = 0
+            apply_lls = []
             for o in obs_to_move:
-                p_reassign, s_new = self.propose_simplex(o, alpha=RJ_COR_ALPHA)
+                p_reassign, s_new = self.propose_simplex(o)
                 coresp_apply_ll += np.log(p_reassign[s_new])
+                apply_lls.append(p_reassign[s_new])
                 o.s = s_new
-            self.N -= 1
-            # set_trace()
+            self.N -= 1            
+
+            # new_ll = self.log_likelihood()
+            # ll_forward = pick_v_ll + kill_ll + coresp_apply_ll
+            # ll_backward = pick_v_neigh_ll + birth_ll + coresp_undo_ll + len_ll
+            # ll_alpha = min(0, (new_ll + ll_backward) - (old_ll + ll_forward))    
+            # print "apply_coresp:\t{}\tundo_coresp:\t{}".format(coresp_apply_ll, coresp_undo_ll)
+            # print "death:\told_ll:\t{}\tnew_ll:\t{}\tforward:{}\tbackward:{}\taccept:\t{}".format(
+            #     old_ll, new_ll, ll_forward, ll_backward, ll_alpha)
+
+            # import pdb; pdb.set_trace()
             return (pick_v_ll + kill_ll + coresp_apply_ll, 
                     pick_v_neigh_ll + birth_ll + coresp_undo_ll + len_ll)
 
@@ -404,9 +451,11 @@ class BayesMesh1D(object):
         length = np.linalg.norm(vec)
         vec /= length
         
-        # subtract 1 b/c prior is over [1, \infty)
-        length = self.len_prior.rvs() - 1
-        len_ll = self.len_prior.logpdf(length + 1)
+        length = -1
+        while length < 0:            
+            length = self.birth_proposal.rvs()
+
+        len_ll = self.birth_proposal.logpdf(length)
     
         birth_record = self.cmplx.birth_vertex(v, vec, length, persist=False)
         birth_ll = self.cmplx.birth_ll(birth_record)
@@ -425,22 +474,31 @@ class BayesMesh1D(object):
         for o in obs_to_move:
             obs_undo.append((o, o.s, o.s.get_key()))
             assert o.s in self.cmplx.simplices.values()
-            p_undo, _ = self.propose_simplex(o, alpha=RJ_COR_ALPHA)
+            p_undo, _ = self.propose_simplex(o)
             coresp_undo_ll += np.log(p_undo[o.s])
         
         def f_apply():
             # self.draw()
             # set_trace()
+            old_ll = self.log_likelihood()
             self.cmplx.birth_vertex(birth_record=birth_record)
             coresp_apply_ll = 0
             for o in obs_to_move:
-                p_reassign, s_new = self.propose_simplex(o, alpha=RJ_COR_ALPHA)
+                p_reassign, s_new = self.propose_simplex(o)
                 o.s = s_new
                 coresp_apply_ll += np.log(p_reassign[s_new])
                 # print p_reassign, s_new, self.cmplx.simplex_dists(o.pt)
             # self.log_likelihood()
             # self.draw(block=True)
             self.N += 1
+            # new_ll = self.log_likelihood()
+            # ll_forward = pick_v_ll + birth_ll + coresp_apply_ll + len_ll
+            # ll_backward = pick_v_new_ll + kill_ll + coresp_undo_ll
+            # ll_alpha = min(0, (new_ll + ll_backward) - (old_ll + ll_forward))    
+            # print "birth:\told_ll:\t{}\tnew_ll:\t{}\tforward:{}\tbackward:{}\taccept:\t{}".format(
+            #     old_ll, new_ll, ll_forward, ll_backward, ll_alpha)
+
+
             return (pick_v_ll + birth_ll + coresp_apply_ll + len_ll, 
                     pick_v_new_ll + kill_ll + coresp_undo_ll)
 
