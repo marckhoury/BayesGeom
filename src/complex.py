@@ -124,6 +124,16 @@ class Simplex(object):
     
     def get_neighbors(self):
         return self.neighbors
+
+    def local_coords(self, p):
+        Q, o = self._affine_hull()
+        q = p - o
+        lc = np.dot(Q, q)
+        return lc
+
+    def global_coords(self, lc):
+        Q, o = self._affine_hull()
+        return self._pos_in_space(Q, lc) + o
     
     def proj(self, p):
         min_dist = np.inf
@@ -136,6 +146,8 @@ class Simplex(object):
             Q, o = self._affine_hull()
             q = p - o
             lc = np.dot(Q, q)
+            ## seems like maybe this should be 
+            ## self._pos_in_space + o? -- DHM
             gc = self._pos_in_space(Q, lc)
             d1 = np.linalg.norm(gc - q)
             if self._is_interior(Q, o, lc):

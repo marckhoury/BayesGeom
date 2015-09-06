@@ -46,13 +46,13 @@ def parse_arguments():
 if __name__ == '__main__':
     from pdb import pm, set_trace
     args=parse_arguments()
-    observed_pts = get_clouds(H5_FNAME, N=args.n_tests)
+    observed_pts = get_clouds(H5_FNAME, N=args.n_tests, proj_xy=False)
     for obs_pts in observed_pts:
         if obs_pts.shape[0] > args.n_pts:
             indices = np.random.choice(range(obs_pts.shape[0]), 
                                        size=args.n_pts, replace=False)        
             obs_pts = obs_pts[indices, :]
-        m = bm(obs_pts=obs_pts, n_clusters_init=args.n_clusters)
+        m = bm(obs_pts=obs_pts, n_clusters_init=args.n_clusters, d=3)
         if args.init_only:
             m.draw(block=True)
         else:    

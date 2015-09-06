@@ -2,11 +2,15 @@ from __future__ import division
 
 import numpy as np
 from scipy.stats import expon, geom, multivariate_normal as mvn, dirichlet, norm
+import scipy.spatial.distance as ssd
 
 from cvxpy import Variable, Problem, Parameter, sum_squares, Minimize
 import matplotlib.pyplot as plt
 
 from complex import Vertex, Simplex, SimplicialComplex
+from registration import tps_cpd
+
+from sklearn.cluster import KMeans
 
 import time
 
@@ -20,6 +24,58 @@ OBS_SIGMA=.01
 
 P_RESTRICT_AFFINE = 0.3
 
+## TPS kernel needs to be defined over a ball
+## to be PSD
+MAX_R = 100 ## should be big enough this doesn't matter
+
+def tps_kernel1(distmat, d):
+    if d == 1:
+        return 1/12 * (2 * np.power(distmat, 3) -
+                       3*MAX_R*np.power(distmat, 2) +
+                       np.power(MAX_R, 3))
+    elif d == 2:
+        return (2 * np.power(distmat, 2)*np.log(distmat) -
+                (1 + 2*np.log(MAX_R))*np.power(distmat, 2) + 
+                np.power(MAX_R, 2))
+    elif d == 3:
+        ## looks like this is wrong?
+        return (2 * np.power(distmat, 3) + 
+                3 * MAX_R * np.power(distmat, 2) + 
+                np.power(R, 3))
+    else:
+        raise NotImplemented, "tps kernel only defined for dimensions 1-3"
+    
+
+def tps_kernel(pt1, pt2):
+    """
+    Functional forms for dims 1-3 taken from 
+    @article{williams2007gaussian,
+             title={Gaussian process implicit surfaces},
+             author={Williams, Oliver and Fitzgibbon, Andrew},
+             journal={Gaussian Proc. in Practice},
+             year={2007}
+             }
+    """
+    d = pt1.shape[0]
+    r = np.linalg.norm(pt1 - pt2) + 1e-16
+    ## comment in to try RBF
+    # return np.exp(-np.power(r, 2)/10)
+    if d == 1:
+        return 1/12 * (2 * np.power(r, 3) -
+                       3*MAX_R*np.power(r, 2) +
+                       np.power(MAX_R, 3))
+    elif d == 2:
+        return (2 * np.power(r, 2)*np.log(r) -
+                (1 + 2*np.log(MAX_R))*np.power(r, 2) + 
+                np.power(MAX_R, 2))
+    elif d == 3:
+        ## looks like this is wrong?
+        return (2 * np.power(r, 3) + 
+                3 * MAX_R * np.power(r, 2) + 
+                np.power(R, 3))
+    else:
+        raise NotImplemented, "tps kernel only defined for dimensions 1-3"
+
 
 
 class Obs(object):
@@ -30,63 +86,44 @@ class Obs(object):
     eventually, these will generate the actual observations
     """
     
-    def __init__(self, pt, cmplx, sigma=OBS_SIGMA, s_source=None):
+    def __init__(self, obs_pt, cmplx, latent_pt=None, sigma=OBS_SIGMA, s_source=None):
         """
-        pt: position of the point
-        s_source: pointer to simplex that generated point
+        pt: position of the latent point
+        s: pointer to simplex that generated point
         """
-        self.pt = pt
+        self.obs_pt = obs_pt
+
+        self.d = obs_pt.shape[0]
+
         self.cmplx = cmplx
-        self.d = pt.shape[0]
         # Simplex this observation is from
-        self.s = s_source
-        self.noise_dist = norm(loc=0, scale=sigma)
-        if self.s is None:
-            _, _, self.s = cmplx.proj(self.pt)
         ## sanity check
-        assert self.s is not None
-        self._proj_cache = {}
-        self.proj() 
 
-
-    def proj(self):
-        s_key = self.s.get_key()
-        if s_key in self._proj_cache:
-            self.dist, self.q = self._proj_cache[s_key]
+        if latent_pt is None:
+            ## identity if no idea
+            latent_pt = obs_pt
+        self.s = s_source
+        if self.s is None:
+            _, q, self.s = cmplx.proj(latent_pt)
         else:
-            if len(self._proj_cache) > MAX_CACHE_SIZE:
-                self._proj_cache.popitem()
-            
-            self.dist, self.q = self.s.proj(self.pt)
-            self._proj_cache[s_key] = (self.dist, self.q)
-        return self.dist, self.q
+            _, q = self.s.proj(latent_pt)
+
+        assert self.s is not None
+        self.lc = self.s.local_coords(q)
 
     def __repr__(self):
-        return "Obs({},{})".format(self.pt, self.s)
-
-    
-
+        return "Obs({},{},{})".format(self.obs_pt, self.latent_pt, self.s)
             
-    # @profile
-    def log_likelihood(self):
-        self.proj()
-        ## prob of noise from source + probability of selecting source
-        return self.noise_dist.logpdf(self.dist) - np.log(self.s.area())
-
-    def set_source(self, s):
+    def set_source(self, s, lc=None):
         self.s = s
-        self.dist, self.q = self.s.proj(self.pt)
+        self.lc = lc
+
+    def latent_pt(self):
+        return self.s.global_coords(self.lc)
 
     def draw(self, ax):
-        ax.scatter(self.pt[0], self.pt[1], marker='o')
-        ((x_start, y_start), (x_end, y_end)) = (
-            self.pt, self.q)
-        X = [x_start, x_end]
-        Y = [y_start, y_end]
-        ax.scatter(float(self.q[0]), float(self.q[1]), marker='v')
-        ax.plot(X, Y, ls='--')
-        
-        
+        gc = self.latent_pt()
+        ax.scatter(gc[0], gc[1])
 
 class BayesMesh1D(object):
 
@@ -95,7 +132,9 @@ class BayesMesh1D(object):
 
     places a generic prior on complexes
     """
-    def __init__(self, obs_pts=None, cmplx=None, gamma=.9, lmbda=.2, obs_sigma=OBS_SIGMA, propose_sigma=.001, birth_sigma=.1,
+    def __init__(self, obs_pts=None, cmplx=None, 
+                 gamma=.9, lmbda=.2, 
+                 obs_sigma=OBS_SIGMA, propose_sigma=.0005, birth_sigma=.1,
                  d=2, obs=None, N=None, P=None, n_clusters_init=5):
         """
         gamma: geometric variable for prior on number of simplices
@@ -113,9 +152,10 @@ class BayesMesh1D(object):
         self.len_prior = expon(self.lmbda)
 
         self.propose_mvn = mvn(np.zeros(self.d), propose_sigma*np.eye(self.d))
+        self.obs_sigma=obs_sigma
         self.obs_dist = norm(loc=0, scale=obs_sigma)
 
-        self.birth_proposal = norm(loc=lmbda, scale=birth_sigma)
+        self.birth_proposal = norm(loc=0, scale=birth_sigma)
 
         self.cmplx = cmplx
         if self.cmplx is None:
@@ -156,33 +196,177 @@ class BayesMesh1D(object):
         p_simplex = [s.area() for s in simplices]
         total_area = np.sum(p_simplex)
         p_simplex =[p/total_area for p in p_simplex]
+        chosen_simplices = []
         for i in range(n_samples):
             s = np.random.choice(simplices, p=p_simplex)
+            chosen_simplices.append(s)
             lmbda = np.random.rand()
             pt_src = lmbda * s.vertices[0].v + (1-lmbda) * s.vertices[1].v
-            ## compute normal direction
-            normal = s.vertices[0].v - s.vertices[1].v
-            normal[0], normal[1] = normal[1], normal[0]
-            normal = normal / np.linalg.norm(normal)
-            normal[1] *= -1
-            delta = self.obs_dist.rvs()
-            pt = delta*normal + pt_src
-            # print pt_src, pt, delta, normal
-            pts[i, :] = pt
-            self.observations.append(Obs(pt, self.cmplx))
-        return pts
+            # ## compute normal direction
+            # normal = s.vertices[0].v - s.vertices[1].v
+            # normal[0], normal[1] = normal[1], normal[0]
+            # normal = normal / np.linalg.norm(normal)
+            # normal[1] *= -1
+            # delta = self.obs_dist.rvs()
+            # pt = delta*normal + pt_src
+            # # print pt_src, pt, delta, normal
+            pts[i, :] = pt_src
 
-    def set_obs(self, pts, draw=False):
+        C = np.eye(n_samples) * self.obs_sigma
+        for i in range(n_samples):
+            for j in range(n_samples):
+                C[i, j] += tps_kernel(pts[i], pts[j])
+        pts_obs = mvn(np.zeros(n_samples), C).rvs(size=2).T
+
+        for i in range(n_samples):
+            self.observations.append(Obs(pts_obs[i], self.cmplx, pts[i], s_source=chosen_simplices[i]))
+        return pts, pts_obs, chosen_simplices
+
+    def _set_obs(self, pts, latent_pts):
         self.observations = []
         n_obs = pts.shape[0]
         for i in range(n_obs):
-            pt = pts[i, :]
-            o_i = Obs(pt, self.cmplx)
+            o_i = Obs(pts[i], self.cmplx, latent_pt = latent_pts[i])
             self.observations.append(o_i)
+        self.update_kernel_matrix()
+    
+
+    #@profile
+    def set_obs(self, pts, draw=False, n_resets=20):
+
+        d = pts.shape[1]
+        cmplx_pts = self.discretize_cmplx(pts_per_simplex=10)
+
+        pts_h = np.c_[pts, np.ones(pts.shape[0])]
+
+        kmeans = KMeans(init="k-means++", n_clusters=self.N)
+        kmeans.fit_predict(pts)
+        centroids = np.c_[kmeans.cluster_centers_, np.ones(self.N)]
+
+        s_centers = []
+        for s in self.cmplx.simplices.values():
+            s_centers.append(s.global_coords([0.5]))
+        s_centers = np.c_[np.array(s_centers), np.ones(self.N)]
+
+        best_cost = np.inf
+        best_R = None
+
+        import time
+
+        obs_sigma = self.obs_sigma
+        self.obs_sigma = 1
+    
+        for n in range(n_resets):
+            start = time.time()
+            s_indices = range(self.N)
+            k_indices = range(self.N)
+            np.random.shuffle(s_indices)
+            np.random.shuffle(k_indices)
+            X = centroids[k_indices[:d+1]]
+            Y = s_centers[s_indices[:d+1]]
+            R = np.linalg.lstsq(X, Y)[0]
+            pts_w = np.dot(pts_h, R)[:, :-1]
+            self._set_obs(pts, pts_w)
+            if draw:
+                self.draw(block=True, show=False, outf='../figs/debug/registered_{}.png'.format(n))
+            warped_cmplx = self.warp_cmplx()
+            distmat = ssd.cdist(warped_cmplx, pts, 'sqeuclidean')
+            cost = np.sum(np.min(distmat, axis=1))
+            # cost = self.gp_ll()
+            if cost < best_cost:
+                best_cost = cost
+                best_R = R
+
+            print n, best_cost, cost, time.time() - start, -self.gp_ll()
+        
+        pts_w = np.dot(pts_h, best_R)[:, :-1]
+        self.obs_sigma = obs_sigma
+        self._set_obs(pts, pts_w)
+
+        # def f(x):
+        #     theta, alpha, tx, ty = x
+        #     t = np.array([tx, ty])
+        #     start = time.time()
+        #     R = np.array([[np.cos(theta), -np.sin(theta)], 
+        #                   [np.sin(theta), np.cos(theta)]]).reshape((d, d))
+        #     pts_w = R.dot(pts.T).T
+
+        #     distmat = ssd.cdist(alpha * (pts_w) + t, cmplx_pts, 'sqeuclidean')
+
+        #     c = np.sum(np.min(distmat, axis=0)) + np.sum(np.min(distmat, axis=1))
+        #     return c
+        
+        # from scipy.optimize import basinhopping as bh        
+        # x0 = (0, 1, 0, 0)
+        # res = bh(f, x0, niter=100, T=.1, stepsize=.1)
+
+        # theta, alpha, tx, ty = res.x
+
+        # t = np.array([tx, ty])
+
+        # print theta, alpha, t
+
+        # R = np.array([[np.cos(theta), -np.sin(theta)], 
+        #               [np.sin(theta), np.cos(theta)]]).reshape((d, d))
+        # pts_w = R.dot(pts.T).T
+        # pts_w =alpha*( pts_w) + t        
+
+        # self._set_obs(pts, pts_w)
+        
         if draw:
             self.draw(block=True)
 
-    def obs_ll(self):
+################################################################################
+##     GP functions
+################################################################################
+
+    #@profile
+    def update_kernel_matrix(self):
+        self.X = np.zeros((len(self.observations), self.d))
+        self.Y = np.zeros((len(self.observations), self.d))
+        for i, o_i in enumerate(self.observations):
+            self.X[i] = o_i.latent_pt()
+            self.Y[i] = o_i.obs_pt 
+       
+        self.C = self.obs_sigma * np.eye(len(self.observations)) + self.eval_kernel(self.X)
+        self.inv_C = np.linalg.inv(self.C)
+
+    #@profile
+    def eval_kernel(self, U, X=None):
+        if X is None:
+            X = self.X
+        distmat = ssd.cdist(U, X, 'euclidean') + 1e-16
+        d = X.shape[1]
+        res = tps_kernel1(distmat, d)        
+        # import pdb; pdb.set_trace()
+        return res
+        # res = np.zeros((U.shape[0], X.shape[0]))
+        # for i in range(U.shape[0]):
+        #     for j in range(X.shape[0]):
+        #         res[i, j] = tps_kernel(U[i, :], X[j, :])
+        # return res
+
+    def warp_pts(self, U):        
+        C_ux = self.eval_kernel(U)        
+        mu = C_ux.dot(self.inv_C).dot(self.Y)
+        return mu
+
+    def discretize_cmplx(self, pts_per_simplex=10):
+        lmbdas = np.linspace(0, 1, 10)
+        pts = []
+        for s in self.cmplx.simplices.itervalues():
+            v0 = s.vertices[0].v
+            v1 = s.vertices[1].v
+            for l in lmbdas:
+                pts.append(l * v0 + (1-l) * v1)
+        return np.array(pts)  
+
+    def warp_cmplx(self, pts_per_simplex=10):
+        pts = self.discretize_cmplx(pts_per_simplex)
+        warped_pts = self.warp_pts(pts)
+        return warped_pts
+
+    def latent_obs_ll(self):
         ll = 0
         simplices = self.cmplx.simplices.values()
         p_simplex = np.array([s.area() for s in simplices])
@@ -190,53 +374,59 @@ class BayesMesh1D(object):
         p_simplex = dict(zip(simplices, p_simplex))
         for o in self.observations:
             ## need to compute distance to observation
-            ll += o.log_likelihood()
+            # ll += o.log_likelihood()
             ll += p_simplex[o.s]
+        return ll    
+
+    #@profile
+    def gp_ll(self):
+        self.update_kernel_matrix()
+        ll = np.trace(self.Y.T.dot(self.inv_C).dot(self.Y))
         return ll
 
-    # @profile
+    ##@profile
     def log_likelihood(self):
         prior_ll = self.prior_ll()
-        obs_ll = self.obs_ll()
+        latent_obs_ll = self.latent_obs_ll()
+        gp_ll = self.gp_ll()
         # print 'prior_ll', prior_ll, 'obs_ll', obs_ll
-        return prior_ll + obs_ll
+        return prior_ll + latent_obs_ll + gp_ll
 
     # @profile
     def mh(self, samples=5000, draw=False, gt_ll=None, gt_structure_ll=None, final_block=False):
         if draw:
-            fig, axarr = plt.subplots(3)
-            axarr[1].set_title('Log-Likelihood')
-            axarr[2].set_title('Stucture Log-Likelihood')
+            fig, axarr = plt.subplots(2,2)
+            axarr[0, 0].set_title('Observed')
+            axarr[0, 1].set_title('Latent')
+            axarr[1, 0].set_title('Log-Likelihood')
+            axarr[1, 1].set_title('Stucture Log-Likelihood')
             log_likelihoods = [self.log_likelihood()]
             prior_ll = [self.prior_ll()]
 
-            l_mcmc,  = axarr[1].plot(range(len(log_likelihoods)), log_likelihoods, label='MCMC')
+            l_mcmc,  = axarr[1, 0].plot(range(len(log_likelihoods)), log_likelihoods, label='MCMC')
 
             if gt_ll:
                 gt_ll_arr = np.ones(samples+1)*gt_ll
-                l_gt,  = axarr[1].plot(range(samples+1), gt_ll_arr, label='Ground Truth')
-            axarr[1].legend(loc='best')
-            axarr[1].set_xlim(0, samples+1)
+                l_gt,  = axarr[1, 0].plot(range(samples+1), gt_ll_arr, label='Ground Truth')
+            axarr[1, 0].legend(loc='best')
+            axarr[1, 0].set_xlim(0, samples+1)
 
-            l_prior_ll,  = axarr[2].plot(range(len(prior_ll)), prior_ll, label='Stucture_LL')
+            l_prior_ll,  = axarr[1, 1].plot(range(len(prior_ll)), prior_ll, label='Stucture_LL')
             if gt_structure_ll:
                 gt_struct_ll_arr = np.ones(samples+1)*gt_structure_ll
-                l_gt_struct = axarr[2].plot(range(samples+1), gt_struct_ll_arr, label="GT_Structure_LL")
+                l_gt_struct = axarr[1, 1].plot(range(samples+1), gt_struct_ll_arr, label="GT_Structure_LL")
 
-            axarr[2].legend(loc='best')
-            axarr[2].set_xlim(0, samples+1)
+            axarr[1, 1].legend(loc='best')
+            axarr[1, 1].set_xlim(0, samples+1)
             plt.show(block=False)
             plt.draw()
             # raw_input('go?')
                 
         proposals = ['vertices', 'correspondence', 'death', 'birth']
-
         accepts = {}
         for p in proposals:
             accepts[p] = (0, 0)
-
         proposal_p = [.3, .6, .05, .05]
-
         proposal_fns = {'vertices':self.propose_vertices, 
                      'correspondence':self.propose_correspondence, 
                      'death':self.propose_vertex_death, 
@@ -245,7 +435,7 @@ class BayesMesh1D(object):
         # proposal_p = [0, 0, 1, 0]
         accept = 0
 
-        print self.log_likelihood()
+        # print self.log_likelihood()
         for i in range(samples):
             propose_i = np.random.choice(proposals, p=proposal_p)
 
@@ -272,14 +462,14 @@ class BayesMesh1D(object):
                 l_mcmc.set_data(range(len(log_likelihoods)), log_likelihoods)
                 l_prior_ll.set_data(range(len(prior_ll)), prior_ll)
                 if gt_structure_ll is not None:
-                    axarr[2].set_ylim(np.min(prior_ll), max(0, np.max(prior_ll), gt_structure_ll))
+                    axarr[1, 1].set_ylim(np.min(prior_ll), max(0, np.max(prior_ll), gt_structure_ll))
                 else:
-                    axarr[2].set_ylim(np.min(prior_ll), max(0, np.max(prior_ll)))
+                    axarr[1, 1].set_ylim(np.min(prior_ll), max(0, np.max(prior_ll)))
                 if gt_ll is not None:
-                    axarr[1].set_ylim(np.min(log_likelihoods), max(0, np.max(log_likelihoods)+50, gt_ll+50))
+                    axarr[1, 0].set_ylim(np.min(log_likelihoods), max(0, np.max(log_likelihoods)+50, gt_ll+50))
                 else:
-                    axarr[1].set_ylim(np.min(log_likelihoods), max(0, np.max(log_likelihoods)+50))
-                self.draw(block=False, ax=axarr[0])
+                    axarr[1, 0].set_ylim(np.min(log_likelihoods), max(0, np.max(log_likelihoods)+50))
+                self.draw(block=False, latent_ax=axarr[0, 0], true_ax=axarr[0, 1])
                 plt.draw()
                 time.sleep(.1)
             for o in self.observations:
@@ -287,7 +477,7 @@ class BayesMesh1D(object):
 
         if draw:
             l_mcmc.set_data(range(len(log_likelihoods)), log_likelihoods)
-            self.draw(block=final_block, ax=axarr[0])
+            self.draw(block=final_block, latent_ax=axarr[0, 0], true_ax=axarr[0, 1])
             
         
     # @profile            
@@ -331,7 +521,7 @@ class BayesMesh1D(object):
         return (f_apply, f_undo)
 
     def propose_simplex(self, o):
-        distances = self.cmplx.simplex_dists(o.pt)
+        distances = self.cmplx.simplex_dists(o.latent_pt())
         
         simplices = []
         probs = np.zeros(len(distances))
@@ -341,6 +531,10 @@ class BayesMesh1D(object):
             probs[i] = self.obs_dist.pdf(distances[s])
 
         probs /= np.sum(probs)
+        if np.any(np.isnan(probs)):
+            ## fall back onto a uniform dist if 
+            ## probs sum to 0
+            probs = np.ones(len(distances)) * 1/ len(distances)
 
         s_new = np.random.choice(simplices, p=probs)
         res = dict(zip(simplices, probs))
@@ -395,8 +589,8 @@ class BayesMesh1D(object):
         birth_ll = self.cmplx.birth_ll(birth_record)
 
         ## compute observations to reassign to simplices
-        # obs_to_move = [o for o in self.observations if o.s in self.cmplx.stars[v]]
-        obs_to_move = self.observations
+        obs_to_move = [o for o in self.observations if o.s in self.cmplx.stars[v]]
+        # obs_to_move = self.observations
         obs_undo = []
         coresp_undo_ll = 0
         undo_lls = []
@@ -466,8 +660,8 @@ class BayesMesh1D(object):
 
         ## reassign observations that point to simplices 
         ## that will change
-        # obs_to_move = [o for o in self.observations if o.s in self.cmplx.stars[v]]
-        obs_to_move = self.observations
+        obs_to_move = [o for o in self.observations if o.s in self.cmplx.stars[v]]
+        # obs_to_move = self.observations
         # print v, len(obs_to_move)
         obs_undo = []
         coresp_undo_ll = 0
@@ -489,7 +683,7 @@ class BayesMesh1D(object):
                 coresp_apply_ll += np.log(p_reassign[s_new])
                 # print p_reassign, s_new, self.cmplx.simplex_dists(o.pt)
             # self.log_likelihood()
-            # self.draw(block=True)
+            # self.draw()
             self.N += 1
             # new_ll = self.log_likelihood()
             # ll_forward = pick_v_ll + birth_ll + coresp_apply_ll + len_ll
@@ -497,6 +691,7 @@ class BayesMesh1D(object):
             # ll_alpha = min(0, (new_ll + ll_backward) - (old_ll + ll_forward))    
             # print "birth:\told_ll:\t{}\tnew_ll:\t{}\tforward:{}\tbackward:{}\taccept:\t{}".format(
             #     old_ll, new_ll, ll_forward, ll_backward, ll_alpha)
+            # import pdb; pdb.set_trace()
 
 
             return (pick_v_ll + birth_ll + coresp_apply_ll + len_ll, 
@@ -563,18 +758,64 @@ class BayesMesh1D(object):
         def f_undo():
             self.cmplx.merge_vertex(merge_record=merge_record)
 
-    def draw(self, ax=None, block=False):
-        if ax is None:
-            fig = plt.figure()
-            ax = fig.add_subplot(1, 1, 1)
-        ax.cla()
+################################################################################
+##     Drawing Utilities
+################################################################################
+
+    def warp_lines(self, low=-1, high=3):
+        l_vals = np.linspace(low, high, 4)        
+        y_vals = np.linspace(low, high, 30)
+        lines = []
+        warped_lines = []
+        pts = np.zeros((30, 2))
+        for l in l_vals:
+            ## horizontal
+            pts[:, 0] = l
+            pts[:, 1] = y_vals
+            lines.append(pts.copy())
+            warped_lines.append(self.warp_pts(pts))
+
+            ## vertical
+            pts[:, 1] = l
+            pts[:, 0] = y_vals
+            lines.append(pts.copy())
+            warped_lines.append(self.warp_pts(pts))
+        return lines, warped_lines
+
+        
+
+    def draw(self, latent_ax=None, true_ax=None, show=True, block=False, outf=None):
+        if latent_ax is None:
+            fig, (latent_ax, true_ax) = plt.subplots(1, 2)
+
+        latent_lines, true_lines = self.warp_lines()
+
+        latent_ax.cla()
+        latent_ax.set_title('Latent')
         for s in self.cmplx.simplices.itervalues():
-            ((x0, y0), (x1, y1)) = s.vertices[0].v, s.vertices[1].v
-            ax.plot([x0, x1], [y0, y1])
+            try:
+                ((x0, y0), (x1, y1)) = s.vertices[0].v, s.vertices[1].v
+            except ValueError:
+                ((x0, y0, z0), (x1, y1, z0)) = s.vertices[0].v, s.vertices[1].v
+            latent_ax.plot([x0, x1], [y0, y1], color='r')
+        for l in latent_lines:
+            latent_ax.plot(l[:, 0], l[:, 1], color='g')
         if self.observations:
             for o in self.observations:
-                o.draw(ax)
-        plt.show(block=block)
+                o.draw(latent_ax)        
+        if true_ax is not None and self.observations:
+            true_ax.cla()
+            true_ax.set_title('Observed')
+            for o in self.observations:
+                true_ax.scatter(o.obs_pt[0], o.obs_pt[1], marker='o', color='b')
+            warped_cmplx = self.warp_cmplx()
+            true_ax.scatter(warped_cmplx[:, 0], warped_cmplx[:, 1], marker='x', color='r')
+        for l in true_lines:
+            true_ax.plot(l[:, 0], l[:, 1], color='g')
+        if outf is not None:
+            plt.savefig(outf, bbox_inches='tight')
+        if show:
+            plt.show(block=block)
 
 
         
@@ -656,13 +897,28 @@ if __name__ == '__main__':
         check_init()
     
     m_gt = create_house()
-    observed_pts = m_gt.sample_obs(100)
-    m_gt.set_obs(observed_pts)
-    gt_ll = m_gt.log_likelihood()
-    gt_struct_ll = m_gt.prior_ll()
-    m = BayesMesh1D(obs_pts = observed_pts, n_clusters_init=args.n_clusters)
+    # set_trace()
+    # latent_pts, observed_pts, simplices = m_gt.sample_obs(100)
 
-    m.mh(draw=20, gt_ll=gt_ll, gt_structure_ll=gt_struct_ll)
+    # gt_ll = m_gt.log_likelihood()
+    # gt_struct_ll = m_gt.prior_ll()
+    # print gt_ll, gt_struct_ll
+    # m_gt.draw(block=True, show=False, outf='../figs/debug/init.png')
+
+    from static_ropetest import get_clouds, H5_FNAME
+    obs_pts = get_clouds(H5_FNAME, keys=[7])[0]
+
+    if obs_pts.shape[0] > 200:
+        indices = np.random.choice(range(obs_pts.shape[0]), 
+                                   size=200, replace=False)        
+        obs_pts = obs_pts[indices, :]
+
+
+    m_gt.set_obs(obs_pts)
+    m_gt.draw(block=True, show=False, outf='../figs/debug/registered.png')
+    # m = BayesMesh1D(obs_pts = observed_pts, n_clusters_init=args.n_clusters)
+
+    # m.mh(draw=20, gt_ll=gt_ll, gt_structure_ll=gt_struct_ll)
 
 
     
