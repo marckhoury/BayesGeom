@@ -162,6 +162,71 @@ class Simplex(object):
                         min_dist = d
                         min_point = r
         return (min_dist, min_point)
+
+    def proj_pts(self, P, min_dist=None, Q = None):
+        if min_dist is None:
+            min_dist = np.inf * np.ones(P.shape[0])
+            Q = np.zeros(P.shape)
+        
+        if self.dim == 0:
+            v = self.vertices[0].as_np_array()
+            dist = np.linalg.norm(P - v, axis=1)
+            idx = dist < min_dist
+            min_dist[idx] = dist[idx]
+            Q[idx, :] = v
+            idx_change = idx
+        else:
+            lc, gc = self.proj_affine(P)
+            D = np.linalg.norm(P - gc, axis=1)
+            idx = D < min_dist
+            interior = np.all(lc >= 0, axis=1)
+            idx_change = idx * interior
+            min_dist[idx_change] = D[idx_change]
+            Q[idx_change, :] = gc[idx_change, :]
+            cont_idx = idx * np.logical_not(interior)
+            mind_cont = min_dist[cont_idx]
+            Q_cont = Q[cont_idx, :]
+            for f in self.facets():
+                d_f, q_f, idx_chng_f = f.proj_pts(gc[cont_idx], min_dist[cont_idx], Q[cont_idx, :])
+                D2 = np.sqrt(np.power(D[cont_idx], 2) + np.power(d_f, 2))
+                idx = D2 < mind_cont
+                mind_cont[idx] = D2[idx]
+                Q_cont[idx, :] = q_f[idx]
+                idx_change[cont_idx] = idx
+            min_dist[cont_idx] = mind_cont
+            Q[cont_idx, :] = Q_cont
+        return min_dist, Q, idx_change
+
+    def proj_affine(self, P):
+        d = P.shape[1]
+        N = P.shape[0]
+        V = np.array([self.vertices[i].as_np_array() for i in range(self.dim+1)]).T
+        Q_i = V.T.dot(V)
+ 
+        Q = linalg.block_diag(*[Q_i for i in range(N)])
+        
+        q = - np.reshape(V.T.dot(P.T).T, (N * (self.dim + 1)))
+        A_i = np.ones(self.dim + 1)
+        A = linalg.block_diag(*[A_i for i in range(N)])
+
+        ## Z * [alpha; lambda].T = c
+        ## lhs of KKT
+        n_vars = N * (self.dim + 1)
+        n_cnts = N        
+        Z = np.zeros((n_vars + n_cnts, n_vars  + n_cnts))
+        Z[:n_vars, :n_vars] = Q
+        Z[n_vars:, :n_vars] = A
+        Z[:n_vars, n_vars:] = A.T
+
+        ## rhs of KKT
+        c = np.zeros(n_vars + n_cnts)
+        c[:n_vars] = -q
+        c[n_vars:] = np.ones(n_cnts)
+
+        alpha = np.linalg.solve(Z, c)
+        alpha = alpha[:n_vars].reshape(N, self.dim + 1)
+        P_affine = alpha.dot(V.T)
+        return alpha, P_affine
             
     def _is_interior(self, Q, o, lc):
         if self.dim == 1:
@@ -348,6 +413,14 @@ class SimplicialComplex(object):
                 min_point = q
                 min_s = s
         return (min_dist, min_point, min_s)
+
+    def proj_pts(self, P):
+        min_dist = np.inf * np.ones(P.shape[0])
+        min_pts = np.zeros(P.shape)
+        for s in self.simplices.itervalues():
+            min_dist, min_pts, _ = s.proj_pts(P, min_dist = min_dist, Q = min_pts)
+        return min_dist, min_pts
+            
 
     def simplex_dists(self, p):
         res = {}

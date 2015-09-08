@@ -3,6 +3,7 @@ from __future__ import division
 import numpy as np
 from scipy.stats import expon, geom, multivariate_normal as mvn, dirichlet, norm
 import scipy.spatial.distance as ssd
+import scipy
 
 from cvxpy import Variable, Problem, Parameter, sum_squares, Minimize
 import matplotlib.pyplot as plt
@@ -20,7 +21,7 @@ MAX_CACHE_SIZE=20
 
 RJ_COR_ALPHA=100
 COR_ALPHA=50
-OBS_SIGMA=.01
+OBS_SIGMA=.1
 
 P_RESTRICT_AFFINE = 0.3
 
@@ -86,7 +87,7 @@ class Obs(object):
     eventually, these will generate the actual observations
     """
     
-    def __init__(self, obs_pt, cmplx, latent_pt=None, sigma=OBS_SIGMA, s_source=None):
+    def __init__(self, obs_pt, cmplx, latent_pt=None, sigma=OBS_SIGMA, s_source=None, proj=False):
         """
         pt: position of the latent point
         s: pointer to simplex that generated point
@@ -104,26 +105,31 @@ class Obs(object):
             latent_pt = obs_pt
         self.s = s_source
         if self.s is None:
-            _, q, self.s = cmplx.proj(latent_pt)
-        else:
-            _, q = self.s.proj(latent_pt)
+            _, _, self.s = cmplx.proj(latent_pt)
+        
+        # else:
+        #     _, q = self.s.proj(latent_pt)
 
         assert self.s is not None
-        self.lc = self.s.local_coords(q)
+        if proj:
+            latent_pt = self.s.proj(latent_pt)
+        self.latent_pt = latent_pt
+        # self.lc = self.s.local_coords(q)
 
     def __repr__(self):
         return "Obs({},{},{})".format(self.obs_pt, self.latent_pt, self.s)
             
     def set_source(self, s, lc=None):
         self.s = s
-        self.lc = lc
+        # self.lc = lc
 
-    def latent_pt(self):
-        return self.s.global_coords(self.lc)
+    # def latent_pt(self):
+    #     return self.s.global_coords(self.lc)
 
     def draw(self, ax):
-        gc = self.latent_pt()
+        gc = self.latent_pt
         ax.scatter(gc[0], gc[1])
+        
 
 class BayesMesh1D(object):
 
@@ -133,7 +139,7 @@ class BayesMesh1D(object):
     places a generic prior on complexes
     """
     def __init__(self, obs_pts=None, cmplx=None, 
-                 gamma=.9, lmbda=.2, 
+                 gamma=.9, lmbda=.2, use_gp=True,
                  obs_sigma=OBS_SIGMA, propose_sigma=.0005, birth_sigma=.1,
                  d=2, obs=None, N=None, P=None, n_clusters_init=5):
         """
@@ -156,6 +162,8 @@ class BayesMesh1D(object):
         self.obs_dist = norm(loc=0, scale=obs_sigma)
 
         self.birth_proposal = norm(loc=0, scale=birth_sigma)
+
+        self.use_gp = use_gp
 
         self.cmplx = cmplx
         if self.cmplx is None:
@@ -203,14 +211,14 @@ class BayesMesh1D(object):
             lmbda = np.random.rand()
             pt_src = lmbda * s.vertices[0].v + (1-lmbda) * s.vertices[1].v
             # ## compute normal direction
-            # normal = s.vertices[0].v - s.vertices[1].v
-            # normal[0], normal[1] = normal[1], normal[0]
-            # normal = normal / np.linalg.norm(normal)
-            # normal[1] *= -1
-            # delta = self.obs_dist.rvs()
-            # pt = delta*normal + pt_src
-            # # print pt_src, pt, delta, normal
-            pts[i, :] = pt_src
+            normal = s.vertices[0].v - s.vertices[1].v
+            normal[0], normal[1] = normal[1], normal[0]
+            normal = normal / np.linalg.norm(normal)
+            normal[1] *= -1
+            delta = self.obs_dist.rvs()
+            pt = delta*normal + pt_src
+            # print pt_src, pt, delta, normal
+            pts[i, :] = pt
 
         C = np.eye(n_samples) * self.obs_sigma
         for i in range(n_samples):
@@ -225,11 +233,11 @@ class BayesMesh1D(object):
     def _set_obs(self, pts, latent_pts):
         self.observations = []
         n_obs = pts.shape[0]
+        _, latent_pts = self.cmplx.proj_pts(latent_pts)
         for i in range(n_obs):
             o_i = Obs(pts[i], self.cmplx, latent_pt = latent_pts[i])
             self.observations.append(o_i)
-        self.update_kernel_matrix()
-    
+        self.update_kernel_matrix()    
 
     #@profile
     def set_obs(self, pts, draw=False, n_resets=20):
@@ -268,6 +276,7 @@ class BayesMesh1D(object):
             pts_w = np.dot(pts_h, R)[:, :-1]
             self._set_obs(pts, pts_w)
             if draw:
+                ## for debugging
                 self.draw(block=True, show=False, outf='../figs/debug/registered_{}.png'.format(n))
             warped_cmplx = self.warp_cmplx()
             distmat = ssd.cdist(warped_cmplx, pts, 'sqeuclidean')
@@ -282,36 +291,6 @@ class BayesMesh1D(object):
         pts_w = np.dot(pts_h, best_R)[:, :-1]
         self.obs_sigma = obs_sigma
         self._set_obs(pts, pts_w)
-
-        # def f(x):
-        #     theta, alpha, tx, ty = x
-        #     t = np.array([tx, ty])
-        #     start = time.time()
-        #     R = np.array([[np.cos(theta), -np.sin(theta)], 
-        #                   [np.sin(theta), np.cos(theta)]]).reshape((d, d))
-        #     pts_w = R.dot(pts.T).T
-
-        #     distmat = ssd.cdist(alpha * (pts_w) + t, cmplx_pts, 'sqeuclidean')
-
-        #     c = np.sum(np.min(distmat, axis=0)) + np.sum(np.min(distmat, axis=1))
-        #     return c
-        
-        # from scipy.optimize import basinhopping as bh        
-        # x0 = (0, 1, 0, 0)
-        # res = bh(f, x0, niter=100, T=.1, stepsize=.1)
-
-        # theta, alpha, tx, ty = res.x
-
-        # t = np.array([tx, ty])
-
-        # print theta, alpha, t
-
-        # R = np.array([[np.cos(theta), -np.sin(theta)], 
-        #               [np.sin(theta), np.cos(theta)]]).reshape((d, d))
-        # pts_w = R.dot(pts.T).T
-        # pts_w =alpha*( pts_w) + t        
-
-        # self._set_obs(pts, pts_w)
         
         if draw:
             self.draw(block=True)
@@ -325,11 +304,11 @@ class BayesMesh1D(object):
         self.X = np.zeros((len(self.observations), self.d))
         self.Y = np.zeros((len(self.observations), self.d))
         for i, o_i in enumerate(self.observations):
-            self.X[i] = o_i.latent_pt()
+            self.X[i] = o_i.latent_pt
             self.Y[i] = o_i.obs_pt 
-       
-        self.C = self.obs_sigma * np.eye(len(self.observations)) + self.eval_kernel(self.X)
-        self.inv_C = np.linalg.inv(self.C)
+        if self.use_gp:
+            self.C = self.obs_sigma * np.eye(len(self.observations)) + self.eval_kernel(self.X)
+            self.inv_C = np.linalg.inv(self.C)
 
     #@profile
     def eval_kernel(self, U, X=None):
@@ -367,30 +346,32 @@ class BayesMesh1D(object):
         return warped_pts
 
     def latent_obs_ll(self):
-        ll = 0
-        simplices = self.cmplx.simplices.values()
-        p_simplex = np.array([s.area() for s in simplices])
-        p_simplex = np.log(p_simplex) - np.log(np.sum(p_simplex))
-        p_simplex = dict(zip(simplices, p_simplex))
-        for o in self.observations:
-            ## need to compute distance to observation
-            # ll += o.log_likelihood()
-            ll += p_simplex[o.s]
-        return ll    
+        ## don't include explicit simplex clusters
+        _, pi = self.cmplx.proj_pts(self.X)
+        ll = - np.power(self.X - pi, 2).sum() / (2*self.obs_sigma)
+        return ll
+
+    def guassian_ll(self):
+        diff = self.Y - self.X
+        return np.sqrt(np.trace(diff.T.dot(diff))) / self.obs_sigma
+
 
     #@profile
     def gp_ll(self):
-        self.update_kernel_matrix()
         ll = np.trace(self.Y.T.dot(self.inv_C).dot(self.Y))
         return ll
 
     ##@profile
     def log_likelihood(self):
+        self.update_kernel_matrix()
         prior_ll = self.prior_ll()
         latent_obs_ll = self.latent_obs_ll()
-        gp_ll = self.gp_ll()
+        if self.use_gp:
+            obs_ll = self.gp_ll()
+        else:
+            obs_ll = self.gaussian_ll()
         # print 'prior_ll', prior_ll, 'obs_ll', obs_ll
-        return prior_ll + latent_obs_ll + gp_ll
+        return prior_ll + latent_obs_ll + obs_ll
 
     # @profile
     def mh(self, samples=5000, draw=False, gt_ll=None, gt_structure_ll=None, final_block=False):
@@ -482,7 +463,6 @@ class BayesMesh1D(object):
         
     # @profile            
     def propose_vertices(self):
-        ## TODO: update to ensure no local overlaps
         ## similar to the way that we need to deal with the RJ steps
         ## symmetric
         ## pick random vertex
@@ -521,7 +501,7 @@ class BayesMesh1D(object):
         return (f_apply, f_undo)
 
     def propose_simplex(self, o):
-        distances = self.cmplx.simplex_dists(o.latent_pt())
+        distances = self.cmplx.simplex_dists(o.latent_pt)
         
         simplices = []
         probs = np.zeros(len(distances))
@@ -852,6 +832,8 @@ def create_house():
 
 def check_project():
     # Sanity check for projections
+    m = create_house()
+    obs = m.sample_obs
     V = np.array([[0, 0], [0, 1]])
 
     cmplx = SimplicialComplex()
@@ -916,6 +898,7 @@ if __name__ == '__main__':
 
     m_gt.set_obs(obs_pts)
     m_gt.draw(block=True, show=False, outf='../figs/debug/registered.png')
+    print m_gt.log_likelihood()
     # m = BayesMesh1D(obs_pts = observed_pts, n_clusters_init=args.n_clusters)
 
     # m.mh(draw=20, gt_ll=gt_ll, gt_structure_ll=gt_struct_ll)
