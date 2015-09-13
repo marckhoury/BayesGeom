@@ -403,15 +403,17 @@ class BayesMesh1D(object):
             plt.draw()
             # raw_input('go?')
                 
-        proposals = ['vertices', 'correspondence', 'death', 'birth']
+        proposals = ['vertices', 'correspondence', 'death', 'birth', 'split', 'merge']
         accepts = {}
         for p in proposals:
             accepts[p] = (0, 0)
-        proposal_p = [.3, .6, .05, .05]
+        proposal_p = [.3, .5, .05, .05, .05, .05]
         proposal_fns = {'vertices':self.propose_vertices, 
                      'correspondence':self.propose_correspondence, 
                      'death':self.propose_vertex_death, 
-                     'birth':self.propose_vertex_birth}
+                     'birth':self.propose_vertex_birth,
+                     'split':self.propose_vertex_split,
+                     'merge':self.propose_vertex_merge}
 
         # proposal_p = [0, 0, 1, 0]
         accept = 0
@@ -692,21 +694,23 @@ class BayesMesh1D(object):
         ## returns a list of holes
         ## where each hole is a set of vertices that could possibly 
         ## be merged
-        options = self.cmplx.merge_options()
-        hole = np.random.choice(options)
+        holes = self.cmplx.merge_options()
+        #hole = np.random.choice(options)
         ## ll of selecting this hole (uniformly from the holes)
-        hole_ll = -np.log(len(options))
+        #hole_ll = -np.log(len(options))
         ## ll of selecting this particular u/v combo
-        pick_v_u_ll = -np.log(len(hole)) - np.log(len(hole) - 1)
-        v, u = np.random.choice(hole, 2, replace=False)
+        pick_v_u_ll = -np.log(len(holes)) - np.log(len(holes) - 1)
+        v, u = np.random.choice(holes, 2, replace=False)
 
-        merge_record, merge_ll = self.cmplx.merge_vertex(v, u, persist=False)
+        merge_record = self.cmplx.merge_vertex(v, u, persist=False)
+        merge_ll = self.cmplx.merge_ll(merge_record)
 
         ## probability we pick v's neighbor to birth v
         pick_v_new_ll = -np.log(len(self.cmplx.vertices) - 1)
         ## computes the steps of the birth_vertex method that
         ## invert the kill record and returns the log-likelihood
-        split_record, split_ll = self.cmplx.split_ll(merge_record=merge_record)
+        split_record = self.cmplx.split_reverse(merge_record)
+        split_ll = self.cmplx.split_ll(split_record)
         def f_apply():
             self.cmplx.merge_vertex(merge_record=merge_record)
             return hole_ll + pick_u_v_ll + merge_ll, pick_v_new_ll + split_ll
@@ -716,24 +720,30 @@ class BayesMesh1D(object):
             return
 
     def propose_vertex_split(self):
-        ## reverse is vertex_merge
+        ## reverse is vertex_mergeA
+        hole = self.cmplx.merge_options()
         v = np.random.choice(self.cmplx.vertices.values())
-        pick_v_ll = -np.log(len(self.cmplx.vertices))
-        split_record, split_ll = self.cmplx.split_vertex(v, persist=False)
+        pick_v_ll = -np.log(len(self.cmplx.vertices) - len(holes))
+        
+        split_record = self.cmplx.split_vertex(v, persist=False) 
+        split_ll = self.cmplx.split_ll(split_record)
 
-        merge_record, merge_ll = self.cmplx.merge_ll(split_record=split_record)
+        merge_record = self.cmplx.merge_reverse(split_record)
+        merge_ll = self.cmplx.merge_ll(merge_record)
 
         def f_apply():
             ## need to compute probability of merging after changing the 
             ## complex
             self.cmplx.split_vertex(split_record=split_record)
-            options = self.cmplx.merge_options()
-            hole_ll = -np.log(len(options))
-            for h in options:
-                if v in h:
-                    pick_v_u_ll = -np.log(len(h)) - np.log(len(h)-1)
-                    break
-            return pick_v_ll + split_ll, hole_ll + pick_v_u_ll + merge_ll
+            holes = self.cmplx.merge_options()
+            pick_v_u_ll = -np.log(len(holes)) - np.log(len(holes)-1)
+            #options = self.cmplx.merge_options()
+            #hole_ll = -np.log(len(options))
+            #for h in options:
+            #    if v in h:
+            #        pick_v_u_ll = -np.log(len(h)) - np.log(len(h)-1)
+            #        break
+            return pick_v_ll + split_ll, pick_v_u_ll + merge_ll
 
         def f_undo():
             self.cmplx.merge_vertex(merge_record=merge_record)

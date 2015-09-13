@@ -333,7 +333,7 @@ class SimplicialComplex(object):
         ## Maps vertices to the set of simplices
         ## that contain it
         self.stars = {}
-        self.holes = []
+        self.holes = set()
         self.next_vertex_index = 0
         self.next_simplex_index = 0
         self.dim = 0
@@ -611,15 +611,23 @@ class SimplicialComplex(object):
     
     def merge_options(self):
         if self.dim == 1:
-            return self.holes[0]
+            return self.holes
     
     def merge_vertex(self, v=None, u=None, persist=False, merge_record=None):
+        if merge_record is not None and 'on_the_fly' in merge_record:
+            u = self.vertices[self.next_vertex_index - 1]
+            assert u in self.holes
+            persist = True
+            merge_record = None
+        
         if merge_record is not None:
             self._apply_merge_record(merge_record)
         elif self.dim == 1:
             merge_record = {}
             merge_record['v'] = v
             merge_record['u'] = u
+            
+            merge_record['hole_size'] = len(self.holes)
             
             sv = self.stars[v][0]
             su = self.stars[u][0]
@@ -628,13 +636,22 @@ class SimplicialComplex(object):
             nu = su[0] if su[0].indeX() != u.index() else nu[1]
             
             merge_record['neighbor_updates'].append((sv, nv, su, nu))
-            
+            merge_record['remove_hole'].append(v)
+            merge_record['remove_hole'].append(u)
+
             if persist:
                 self._apply_merge_record(merge_record)
             return merge_record
-    
+
+    def merge_reverse(self, split_record):
+        if self.dim == 1:
+            merge_record = {}
+            merge_record['on_the_fly'] = True
+            merge_reocrd['v'] = split_record['v']
+            merge_record['hole_size'] = len(self.holes) + 2
+             
     def merge_ll(self, merge_record):
-        pass
+        return -np.log(merge_record['hole_size']) - np.log(merge_record['hole_size'] - 1)
     
     def split_vertex(self, v, persist=False, split_record=None):
         if split_record is not None:
@@ -642,16 +659,38 @@ class SimplicialComplex(object):
         elif self.dim == 1:
             split_record = {}
             split_record['v'] = v
-            split_record['s'] = self.stars[v][0]
-            split_record['t'] = self.stars[v][1] if len(self.stars[v]) > 1 else None
-            split_record['star_size'] = len(self.stars[v]) 
-             
+            split_record['star_size'] = len(self.stars[v])
+            split_record['possible_splits'] = len(self.vertices) - len(self.holes)
+            split_record['neighbor_updates'] = []
+            
+            s1, s2 = next(iter(self.stars[v])), next(next(iter(self.stars[v])))
+            u1 = next(iter(s1.index_set.difference(set(v))))
+            u2 = next(iter(s2.index_set.difference(set(v))))
+            u1 = self.vertices[u1]
+            u2 = self.vertices[u2]
+            split_record['neighbor_updates'].append((s1, u1, s2, u2))
             if persist:
                 self._appply_split_record(split_record)
             return split_record
-    
+
+    def split_reverse(self, merge_record):
+        if self.dim == 1:
+            split_record = {}
+            v, u = merge_record['v'], merge_record['u']
+            split_record['v'] = merge_record['v']
+            split_record['star_size'] = len(self.stars[merge_record['v']]) + 1 
+            split_record['possible_splits'] = len(self.vertices) - len(self.holes) + 1
+            split_record['neighbor_updates'] = []
+            
+            s1 = next(iter(self.stars[v]))
+            s2 = next(iter(self.stars[u]))
+            w1 = next(iter(s1.index_set.difference(set(v))))
+            w2 = next(iter(s2.index_set.difference(set(u))))
+            split_record['neighbor_updates'].append((s1, w1, s2, w2))
+            return split_record
+ 
     def split_ll(self, split_record):
-        pass  
+        return -np.log(split_record['possible_splits'])
         
     def translate_vertex(self, v, coords):
         v.translate(coords)
@@ -706,8 +745,14 @@ class SimplicialComplex(object):
             sv.set_neighbor(nv, su)
             su.set_neighbor(nu, sv)
             su.replace(nu, nv)
+            
+            for v in self.stars[nu]:
+                self.stars[nu].add(v)
             del self.vertices[nu.index()]
             del self.stars[nu]
+
+        for v in merge_record['remove_hole']:
+            self.holes.remove(v)
 
     def _apply_split_record(self, split_record):
         v = split_record['v']
@@ -715,11 +760,17 @@ class SimplicialComplex(object):
         w = self.create_vertex(v_coords)
         for update in split_record['neighbor_updates']:
             sv, nv, su, nu = update
-            sv.set_neighbor(nv, None)
-            su.set_neighbor(nu, None)
-            su.replace(v, w)
-            self.stars[w].add(su)
-            self.stars[v].remove(su)
+            if sv is not None:
+                sv.set_neighbor(nv, None)
+            if su is not None:
+                su.set_neighbor(nu, None)
+                su.replace(v, w)
+                self.stars[w].add(su)
+                self.stars[v].remove(su)
+        
+        for v in split_record['add_hole']:
+            self.hole.add(v)
+        self.hole.add(w)
     
     def _construct_curve(self, points):
         delaunay = Delaunay(points)
@@ -736,7 +787,9 @@ class SimplicialComplex(object):
         for s in self.simplices.values():
             for t in self.simplices.values():
                 s.set_neighbor_auto(t)
-             
+        for v in self.vertices.values():
+            if len(self.stars[v]) == 1:
+                self.holes.add(v)
             
     def _get_curve_edges(self, points, i, neighbors):
         min_dist = np.inf
